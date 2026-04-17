@@ -2523,11 +2523,7 @@ def main() -> None:
     log.info("TweetSniper is running… (Ctrl+C to stop)")
     app.run_polling(
         drop_pending_updates=True,
-        bootstrap_retries=10,        # retry up to 10× if network is flaky at startup
-        read_timeout=30,
-        write_timeout=30,
-        connect_timeout=30,
-        pool_timeout=30,
+        bootstrap_retries=10,   # retry up to 10× if network is flaky at startup
     )
 
 
