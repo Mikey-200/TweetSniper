@@ -1,0 +1,10 @@
+# TweetSniper — Railway / Docker deployment config
+# Railway reads this to know how to run the service
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
