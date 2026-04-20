@@ -48,7 +48,10 @@ from telegram.ext import (
 )
 
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client.clob_types import (
+    OrderArgs, OrderType, BalanceAllowanceParams,
+    TradeParams, OpenOrderParams, BookParams,
+)
 from py_clob_client.order_builder.constants import BUY, SELL
 
 load_dotenv()
@@ -244,32 +247,30 @@ async def run_clob(fn, *args, **kwargs):
 # ──────────────────────────────────────────────────────────────────────
 
 async def get_proxy_balance() -> float:
-    """Get USDC balance from the Polymarket proxy wallet.
+    """Get USDC trading balance from Polymarket's CLOB API.
 
-    py-clob-client's get_balance() return format varies by version:
-      - plain float
-      - numeric string
-      - dict with "balance" key
-      - dict with nested "data" → "balance"
-    We try all formats before returning 0.0.
+    Uses get_balance_allowance() — the correct method name in py-clob-client.
+    Returns the 'balance' or 'allowance' field depending on what the API returns.
     """
     if clob is None:
         return 0.0
     try:
-        raw = await run_clob(clob.get_balance)
-        if isinstance(raw, (int, float)):
+        params = BalanceAllowanceParams(signature_type=2)  # proxy wallet type
+        raw = await run_clob(clob.get_balance_allowance, params)
+        if isinstance(raw, dict):
+            # Try common field names returned by the API
+            for key in ("balance", "allowance", "USDC", "usdc"):
+                if key in raw and raw[key] is not None:
+                    return float(raw[key])
+            log.warning("get_balance_allowance keys: %s", list(raw.keys()))
+        elif isinstance(raw, (int, float)):
             return float(raw)
-        if isinstance(raw, str):
+        elif isinstance(raw, str):
             try:
                 return float(raw)
             except ValueError:
                 pass
-        if isinstance(raw, dict):
-            if "balance" in raw:
-                return float(raw["balance"])
-            if "data" in raw and isinstance(raw["data"], dict):
-                return float(raw["data"].get("balance", 0.0))
-        log.warning("Unknown get_balance() return format: %s", type(raw))
+        log.warning("Unknown get_balance_allowance format: %s — %s", type(raw), str(raw)[:120])
         return 0.0
     except Exception as e:
         log.error("get_proxy_balance error: %s", e)
@@ -277,20 +278,25 @@ async def get_proxy_balance() -> float:
 
 
 async def get_eoa_usdc_balance() -> float:
-    """Get USDC balance (both USDC.e and native USDC) of the signing key address."""
+    """Get USDC balance (USDC.e + native) at both signing key AND proxy wallet addresses."""
     if not ALCHEMY_RPC_URL or not PRIVATE_KEY:
         return 0.0
     try:
         w3 = Web3(Web3.HTTPProvider(ALCHEMY_RPC_URL))
         from eth_account import Account
         acct = Account.from_key(PRIVATE_KEY)
+        # Check both the EOA (signing key) and the proxy wallet address
+        addresses_to_check = [acct.address]
+        if PROXY_WALLET and PROXY_WALLET.lower() != acct.address.lower():
+            addresses_to_check.append(Web3.to_checksum_address(PROXY_WALLET))
         total = 0.0
-        for token_addr in (USDC_ADDRESS, USDC_NATIVE_ADDRESS):
-            usdc = w3.eth.contract(
-                address=Web3.to_checksum_address(token_addr), abi=ERC20_ABI
-            )
-            raw = usdc.functions.balanceOf(acct.address).call()
-            total += raw / (10 ** USDC_DECIMALS)
+        for addr in addresses_to_check:
+            for token_addr in (USDC_ADDRESS, USDC_NATIVE_ADDRESS):
+                usdc = w3.eth.contract(
+                    address=Web3.to_checksum_address(token_addr), abi=ERC20_ABI
+                )
+                raw = usdc.functions.balanceOf(addr).call()
+                total += raw / (10 ** USDC_DECIMALS)
         return total
     except Exception as e:
         log.error("get_eoa_usdc_balance error: %s", e)
@@ -2173,10 +2179,11 @@ async def balance_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     raw_info = ""
     if clob is not None:
         try:
-            raw = await run_clob(clob.get_balance)
-            raw_info = f"\n  Raw API: <code>{str(raw)[:80]}</code>"
+            params = BalanceAllowanceParams(signature_type=2)
+            raw = await run_clob(clob.get_balance_allowance, params)
+            raw_info = f"\n  Raw API: <code>{str(raw)[:100]}</code>"
         except Exception as e:
-            raw_info = f"\n  Raw API error: <code>{str(e)[:60]}</code>"
+            raw_info = f"\n  Raw API error: <code>{str(e)[:80]}</code>"
 
     from eth_account import Account
     try:
