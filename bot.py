@@ -130,8 +130,9 @@ WS_URL           = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 POLYMARKET_BASE  = "https://polymarket.com"
 
 # === On-Chain ===
-USDC_ADDRESS     = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-USDC_DECIMALS    = 6
+USDC_ADDRESS       = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"  # USDC.e (bridged)
+USDC_NATIVE_ADDRESS= "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"  # native USDC on Polygon
+USDC_DECIMALS      = 6
 ERC20_ABI = [
     {
         "name": "transfer",
@@ -276,18 +277,21 @@ async def get_proxy_balance() -> float:
 
 
 async def get_eoa_usdc_balance() -> float:
-    """Get USDC.e balance of the EOA wallet (the signing key address)."""
+    """Get USDC balance (both USDC.e and native USDC) of the signing key address."""
     if not ALCHEMY_RPC_URL or not PRIVATE_KEY:
         return 0.0
     try:
         w3 = Web3(Web3.HTTPProvider(ALCHEMY_RPC_URL))
         from eth_account import Account
         acct = Account.from_key(PRIVATE_KEY)
-        usdc = w3.eth.contract(
-            address=Web3.to_checksum_address(USDC_ADDRESS), abi=ERC20_ABI
-        )
-        raw = usdc.functions.balanceOf(acct.address).call()
-        return raw / (10 ** USDC_DECIMALS)
+        total = 0.0
+        for token_addr in (USDC_ADDRESS, USDC_NATIVE_ADDRESS):
+            usdc = w3.eth.contract(
+                address=Web3.to_checksum_address(token_addr), abi=ERC20_ABI
+            )
+            raw = usdc.functions.balanceOf(acct.address).call()
+            total += raw / (10 ** USDC_DECIMALS)
+        return total
     except Exception as e:
         log.error("get_eoa_usdc_balance error: %s", e)
         return 0.0
@@ -2160,15 +2164,32 @@ async def orders_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def balance_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show proxy wallet and EOA USDC balances."""
+    """Show proxy wallet and EOA USDC balances with diagnostics."""
     msg = update.message or update.callback_query.message
     proxy_bal = await get_proxy_balance()
     eoa_bal   = await get_eoa_usdc_balance()
+
+    # Also get raw API response for diagnostics
+    raw_info = ""
+    if clob is not None:
+        try:
+            raw = await run_clob(clob.get_balance)
+            raw_info = f"\n  Raw API: <code>{str(raw)[:80]}</code>"
+        except Exception as e:
+            raw_info = f"\n  Raw API error: <code>{str(e)[:60]}</code>"
+
+    from eth_account import Account
+    try:
+        eoa_addr = Account.from_key(PRIVATE_KEY).address if PRIVATE_KEY else "?"
+    except Exception:
+        eoa_addr = "invalid key"
+
     await msg.reply_text(
         f"💰 <b>Balances</b>\n"
         f"  Proxy (trading): <b>${proxy_bal:.2f}</b>\n"
-        f"  EOA (signing):   <b>${eoa_bal:.2f}</b>\n"
-        f"  <code>{PROXY_WALLET[:24]}…</code>",
+        f"  EOA on-chain:    <b>${eoa_bal:.2f}</b>{raw_info}\n\n"
+        f"  Proxy addr: <code>{PROXY_WALLET[:24]}…</code>\n"
+        f"  EOA addr:   <code>{eoa_addr[:24]}…</code>",
         parse_mode="HTML",
         reply_markup=main_menu_keyboard(),
     )
