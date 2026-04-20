@@ -247,34 +247,13 @@ async def run_clob(fn, *args, **kwargs):
 # ──────────────────────────────────────────────────────────────────────
 
 async def get_proxy_balance() -> float:
-    """Get USDC trading balance from Polymarket's CLOB API.
+    """Get USDC trading balance — reads on-chain from Alchemy.
 
-    Uses get_balance_allowance() — the correct method name in py-clob-client.
-    Returns the 'balance' or 'allowance' field depending on what the API returns.
+    The CLOB API's get_balance_allowance() returns 'Invalid asset type' for
+    email/magic-link proxy accounts. The on-chain balance at the proxy wallet
+    is the real source of truth and works reliably via Alchemy RPC.
     """
-    if clob is None:
-        return 0.0
-    try:
-        params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=2)
-        raw = await run_clob(clob.get_balance_allowance, params)
-        if isinstance(raw, dict):
-            # Try common field names returned by the API
-            for key in ("balance", "allowance", "USDC", "usdc"):
-                if key in raw and raw[key] is not None:
-                    return float(raw[key])
-            log.warning("get_balance_allowance keys: %s", list(raw.keys()))
-        elif isinstance(raw, (int, float)):
-            return float(raw)
-        elif isinstance(raw, str):
-            try:
-                return float(raw)
-            except ValueError:
-                pass
-        log.warning("Unknown get_balance_allowance format: %s — %s", type(raw), str(raw)[:120])
-        return 0.0
-    except Exception as e:
-        log.error("get_proxy_balance error: %s", e)
-        return 0.0
+    return await get_eoa_usdc_balance()
 
 
 async def get_eoa_usdc_balance() -> float:
@@ -2192,11 +2171,11 @@ async def balance_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         eoa_addr = "invalid key"
 
     await msg.reply_text(
-        f"💰 <b>Balances</b>\n"
-        f"  Proxy (trading): <b>${proxy_bal:.2f}</b>\n"
-        f"  EOA on-chain:    <b>${eoa_bal:.2f}</b>{raw_info}\n\n"
-        f"  Proxy addr: <code>{PROXY_WALLET[:24]}…</code>\n"
-        f"  EOA addr:   <code>{eoa_addr[:24]}…</code>",
+        f"💰 <b>Balances (on-chain)</b>\n"
+        f"  Trading balance: <b>${proxy_bal:.2f} USDC</b>\n\n"
+        f"  Proxy wallet: <code>{PROXY_WALLET[:24]}…</code>\n"
+        f"  EOA (signing): <code>{eoa_addr[:24]}…</code>\n\n"
+        f"  {'✅ Sufficient to trade' if proxy_bal >= ORDER_SIZE_USD else '⚠️ Insufficient — deposit more USDC'}",
         parse_mode="HTML",
         reply_markup=main_menu_keyboard(),
     )
