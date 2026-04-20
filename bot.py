@@ -664,6 +664,25 @@ def describe_bucket_analysis(tokens: list, pace: dict) -> str:
 # ──────────────────────────────────────────────────────────────────────
 
 
+def normalize_token_id(token_id: str) -> str:
+    """Convert hex token ID (0x...) to decimal string as required by the CLOB API.
+
+    The Gamma HTTP API returns token IDs in decimal format:
+      '8501497159083948713316135768103773293754490207922884688769443031624417212426'
+
+    The polymarket-cli formats them in hex using Rust's default Display:
+      '0xff3726cc58c499da70c5f9e7e5b99a76a39e3f3...'
+
+    The CLOB's get_order_book and post_order endpoints ONLY accept decimal format.
+    """
+    if isinstance(token_id, str) and token_id.lower().startswith("0x"):
+        try:
+            return str(int(token_id, 16))
+        except ValueError:
+            pass
+    return token_id
+
+
 async def fetch_elon_markets_cli() -> list:
     """Search for Elon tweet-count markets and GROUP them into multi-bucket events.
 
@@ -786,7 +805,7 @@ async def fetch_elon_markets_cli() -> list:
         try:
             token_ids  = json.loads(m.get("clobTokenIds",  "[]") or "[]")
             prices_raw = json.loads(m.get("outcomePrices", "[]") or "[]")
-            yes_token  = token_ids[0]  if token_ids  else None
+            yes_token  = normalize_token_id(token_ids[0])  if token_ids  else None
             yes_price  = float(prices_raw[0]) if prices_raw else 0.0
         except Exception:
             continue
@@ -1199,6 +1218,8 @@ async def process_market(app: Application, market: dict,
         prices = json.loads(prices_raw) if isinstance(prices_raw, str) else (prices_raw or [])
     except (json.JSONDecodeError, TypeError):
         prices = []
+
+    clob_ids = [normalize_token_id(t) for t in clob_ids]
 
     if not clob_ids or not outcome_labels:
         log.warning("No CLOB token IDs or outcomes for: %s", question[:60])
