@@ -1320,8 +1320,18 @@ async def process_market(app: Application, market: dict,
         book = await fetch_orderbook_with_retry(token_id)
         is_fallback_gtc = False
 
-        if book is None or not book.get("asks"):
-            # Step 6: Fallback GTC order at predefined price
+        if book is None:
+            # Total fetch failure — token_id likely invalid or market not live yet.
+            # Do NOT place an order; just skip this bucket.
+            log.warning("Orderbook fetch failed entirely for %s (token: %s…) — skipping",
+                        label, token_id[:16])
+            await send_message(app,
+                f"⚠️ Bucket <b>{label}</b> skipped — orderbook unreachable\n"
+                f"  Token: <code>{token_id[:20]}…</code>")
+            continue
+
+        if not book.get("asks"):
+            # Orderbook returned but has no asks — GTC fallback at preset price
             log.warning("No asks after retries for %s — placing GTC fallback", label)
             is_fallback_gtc = True
             exec_price = FALLBACK_GTC_PRICE
@@ -1351,6 +1361,8 @@ async def process_market(app: Application, market: dict,
         size_shares = ORDER_SIZE_USD / best_ask
         tp_target   = best_ask * tp_mult
 
+        log.info("Placing order: bucket=%s token=%s… price=%.4f size=%.4f",
+                 label, token_id[:16], exec_price, size_shares)
         try:
             order_args = OrderArgs(
                 token_id=token_id,
@@ -1359,14 +1371,17 @@ async def process_market(app: Application, market: dict,
                 side=BUY,
             )
             signed = await run_clob(clob.create_order, order_args)
-            order_type = OrderType.GTC if is_fallback_gtc else OrderType.GTC
+            order_type = OrderType.GTC
             resp = await run_clob(clob.post_order, signed, order_type)
 
             order_id = resp.get("orderID", resp.get("id", f"local_{int(time.time())}"))
         except Exception as e:
-            log.error("Order placement failed for %s: %s", label, e)
+            log.error("Order placement failed for %s (token %s…): %s",
+                      label, token_id[:16], e)
             await send_message(app,
-                f"❌ Order failed for bucket <b>{label}</b>:\n<code>{str(e)[:200]}</code>")
+                f"❌ Order failed for bucket <b>{label}</b>:\n"
+                f"  Token: <code>{token_id[:24]}…</code>\n"
+                f"  Error: <code>{str(e)[:200]}</code>")
             continue
 
         # Register position
