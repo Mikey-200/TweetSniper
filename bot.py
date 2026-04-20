@@ -49,7 +49,7 @@ from telegram.ext import (
 
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import (
-    OrderArgs, OrderType, BalanceAllowanceParams,
+    OrderArgs, OrderType, BalanceAllowanceParams, AssetType,
     TradeParams, OpenOrderParams, BookParams,
 )
 from py_clob_client.order_builder.constants import BUY, SELL
@@ -255,7 +255,7 @@ async def get_proxy_balance() -> float:
     if clob is None:
         return 0.0
     try:
-        params = BalanceAllowanceParams(signature_type=2)  # proxy wallet type
+        params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=2)
         raw = await run_clob(clob.get_balance_allowance, params)
         if isinstance(raw, dict):
             # Try common field names returned by the API
