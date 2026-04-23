@@ -22,6 +22,7 @@ import asyncio
 import csv
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -101,13 +102,13 @@ TWEET_COUNT_KEYWORDS   = {"tweet", "post", "times"}          # AND at least one 
 
 # === Order Parameters ===
 ORDER_SIZE_USD         = float(os.getenv("ORDER_SIZE_USD", "1.0"))
-MIN_BUY_PRICE          = float(os.getenv("MIN_BUY_PRICE", "0.01"))   # skip tiny/garbage buckets
+MIN_BUY_PRICE          = float(os.getenv("MIN_BUY_PRICE", "0.10"))   # skip buckets below 10¢
 MAX_BUY_PRICE          = float(os.getenv("MAX_BUY_PRICE", "0.30"))
 MAX_BUY_PRICE_ONGOING  = float(os.getenv("MAX_BUY_PRICE_ONGOING", "0.20"))
 MAX_SPREAD             = float(os.getenv("MAX_SPREAD", "0.25"))
 EMPTY_BOOK_RETRIES     = int(os.getenv("EMPTY_BOOK_RETRIES", "6"))
 FALLBACK_GTC_PRICE     = float(os.getenv("FALLBACK_GTC_PRICE", "0.25"))
-BUCKETS_TO_BUY         = int(os.getenv("BUCKETS_TO_BUY", "4"))
+BUCKETS_TO_BUY         = int(os.getenv("BUCKETS_TO_BUY", "3"))
 SKIP_MARGIN_MULTIPLIER = float(os.getenv("SKIP_MARGIN_MULTIPLIER", "1.5"))
 
 # === Position Management ===
@@ -613,12 +614,19 @@ def select_buckets(tokens: list, pace: dict) -> list:
     if center_idx is None:
         center_idx = len(filtered) - 1
 
-    # Select center + up to (BUCKETS_TO_BUY-1) buckets above (upward bias)
-    start = center_idx
-    end   = min(center_idx + BUCKETS_TO_BUY, len(filtered))
-    selected = filtered[start:end]
+    # NEW STRATEGY: CENTER + 1 bucket below + 1 bucket above
+    # This is symmetric around the projected count, giving 3 positions:
+    #   [center-1]  (lower neighbour — catches slight undershoot)
+    #   [center]    (highest probability — directly on projection)
+    #   [center+1]  (upper neighbour — catches slight overshoot)
+    selected = []
+    if center_idx > 0:
+        selected.append(filtered[center_idx - 1])   # 1 below center
+    selected.append(filtered[center_idx])            # center
+    if center_idx + 1 < len(filtered):
+        selected.append(filtered[center_idx + 1])   # 1 above center
 
-    # Build result with slot index
+    # Build result: slot 0 = below, slot 1 = center, slot 2 = above
     result = []
     for slot_idx, (low, high, token_id, label) in enumerate(selected):
         result.append((token_id, label, slot_idx, low, high))
@@ -1339,6 +1347,15 @@ async def process_market(app: Application, market: dict,
     for token_id, label, slot_idx, low, high in selected_tokens:
         tp_mult = TP_SLOTS[slot_idx] if slot_idx < len(TP_SLOTS) else 2.0
 
+        # Per-bucket balance check (balance changes after each fill)
+        current_balance = await get_proxy_balance()
+        if current_balance < ORDER_SIZE_USD:
+            await send_message(app,
+                f"💸 Balance too low to buy bucket <b>{label}</b> — "
+                f"need ${ORDER_SIZE_USD:.2f}, have ${current_balance:.2f}. "
+                f"Skipping remaining buckets.")
+            break  # stop trying more buckets this cycle
+
         # Step 5: Fetch orderbook (with retry for empty books)
         book = await fetch_orderbook_with_retry(token_id)
         is_fallback_gtc = False
@@ -1381,7 +1398,9 @@ async def process_market(app: Application, market: dict,
             exec_price = min(best_ask + 0.01, price_cap)
 
         # size is in SHARES, not USD
-        size_shares = ORDER_SIZE_USD / best_ask
+        # Round UP to 4dp so (size * price) always meets the $1 CLOB minimum
+        raw_shares = ORDER_SIZE_USD / best_ask
+        size_shares = math.ceil(raw_shares * 10_000) / 10_000
         tp_target   = best_ask * tp_mult
 
         log.info("Placing order: bucket=%s token=%s… price=%.4f size=%.4f",
@@ -2160,27 +2179,34 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def orders_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """List all open orders with per-order Cancel/TP buttons."""
+    """List all open positions with per-order manual TP and SL buttons."""
     msg = update.message or update.callback_query.message
     if not open_positions:
-        await msg.reply_text("📭 No open positions.", parse_mode="HTML")
+        await msg.reply_text(
+            "📭 No open positions right now."
+            "\n\nWhen a market is found and orders are placed, they'll appear here.",
+            parse_mode="HTML",
+        )
         return
 
     for order_id, pos in list(open_positions.items()):
         snum = pos["session_num"]
         age  = int(time.time() - pos.get("placed_at", time.time()))
+        age_str = f"{age//3600}h {(age%3600)//60}m" if age >= 3600 else f"{age//60}m {age%60}s"
         kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton(f"❌ Cancel #{snum}", callback_data=f"cancel_order_{snum}"),
-            InlineKeyboardButton(f"💰 TP #{snum}",     callback_data=f"tp_order_{snum}"),
+            InlineKeyboardButton(f"💰 Take Profit #{snum}", callback_data=f"tp_order_{snum}"),
+            InlineKeyboardButton(f"🛑 Cut Loss #{snum}",   callback_data=f"sl_order_{snum}"),
         ]])
+        current_tp  = pos['tp_target']
+        buy_p       = pos['buy_price']
+        stop_p      = round(buy_p * (1.0 - STOP_LOSS_PCT), 4)
         await msg.reply_text(
-            f"📌 <b>Order #{snum}</b>\n"
+            f"📌 <b>Position #{snum}</b>  —  {age_str} old\n"
             f"  Market: {pos['market_question'][:50]}\n"
-            f"  Bucket: {pos['bucket']}\n"
-            f"  Buy:    ${pos['buy_price']:.4f} | TP: ${pos['tp_target']:.4f}\n"
-            f"  Shares: {pos['size_shares']:.2f} | Cost: ${pos['cost_usd']:.2f}\n"
-            f"  Age:    {age//60}m {age%60}s\n"
-            f"  ID:     <code>{order_id}</code>",
+            f"  Bucket: <b>{pos['bucket']}</b>\n"
+            f"  Entry:  ${buy_p:.4f}  │  Shares: {pos['size_shares']:.2f}  │  Cost: ${pos['cost_usd']:.2f}\n"
+            f"  TP:     ${current_tp:.4f}  │  Stop:  ${stop_p:.4f}\n"
+            f"  Order:  <code>{order_id[:26]}…</code>",
             parse_mode="HTML",
             reply_markup=kb,
         )
@@ -2469,12 +2495,32 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         snum = int(data.split("_")[-1])
         order_id = order_registry.get(snum)
         if not order_id or order_id not in open_positions:
-            await q.message.reply_text(f"Order #{snum} not found.")
+            await q.message.reply_text(f"Order #{snum} not found or already closed.")
             return
         pos = open_positions[order_id]
         await q.message.reply_text(
-            f"💰 Triggering manual TP for #{snum}…", parse_mode="HTML")
+            f"💰 Taking profit on #{snum} ({pos['bucket']}) at ${pos['tp_target']:.4f}…",
+            parse_mode="HTML")
         await execute_tp(order_id, ctx.application, pos["tp_target"])
+
+    elif data.startswith("sl_order_"):
+        snum = int(data.split("_")[-1])
+        order_id = order_registry.get(snum)
+        if not order_id or order_id not in open_positions:
+            await q.message.reply_text(f"Order #{snum} not found or already closed.")
+            return
+        pos = open_positions[order_id]
+        token_id = pos["token_id"]
+        # Fetch current best bid for market-sell price
+        try:
+            book = await fetch_orderbook_with_retry(token_id)
+            sell_price = book["bids"][0] if (book and book.get("bids")) else pos["buy_price"] * 0.85
+        except Exception:
+            sell_price = pos["buy_price"] * 0.85
+        await q.message.reply_text(
+            f"🛑 Cutting loss on #{snum} ({pos['bucket']}) at ${sell_price:.4f}…",
+            parse_mode="HTML")
+        await execute_stop_loss(order_id, ctx.application, sell_price)
 
 
 # ──────────────────────────────────────────────────────────────────────
