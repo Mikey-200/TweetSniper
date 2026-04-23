@@ -204,13 +204,15 @@ _last_summary_day: Optional[int] = None
 def _build_clob_client() -> Optional[ClobClient]:
     """Build and authenticate the Polymarket CLOB client.
 
-    Uses signature_type=2 for Polymarket proxy wallets.
-    This is the "proxy" signature type used by ALL email/social login
-    accounts on Polymarket. The polymarket-cli source confirms:
-      "proxy" → SignatureType::Proxy → signature_type=2 in py-clob-client
+    Uses signature_type=1 (POLY_PROXY) for email/Magic.link accounts.
 
-    Your exported private key IS the signing key; PROXY_WALLET is the
-    separate proxy smart contract wallet that holds your USDC balance.
+    Confirmed via py_order_utils source:
+      EOA             = 0  (raw private key, no proxy)
+      POLY_PROXY      = 1  (Magic.link / email login wallet) ← CORRECT FOR US
+      POLY_GNOSIS_SAFE= 2  (browser extension + Gnosis Safe)
+
+    The polymarket-cli uses DEFAULT_SIGNATURE_TYPE="proxy" → SignatureType::Proxy
+    which the CLOB identifies as integer 1 (POLY_PROXY).
     """
     if not PRIVATE_KEY or not PROXY_WALLET:
         log.warning("POLYGON_PRIVATE_KEY or PROXY_WALLET_ADDRESS not set — "
@@ -221,7 +223,7 @@ def _build_clob_client() -> Optional[ClobClient]:
             host=CLOB_HOST,
             key=PRIVATE_KEY,
             chain_id=137,            # Polygon Mainnet
-            signature_type=2,        # proxy wallet (email/social login accounts)
+            signature_type=1,        # POLY_PROXY — email/Magic.link accounts
             funder=PROXY_WALLET,     # proxy wallet address that holds your USDC
         )
         creds = c.create_or_derive_api_creds()
@@ -2194,7 +2196,7 @@ async def balance_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     raw_info = ""
     if clob is not None:
         try:
-            params = BalanceAllowanceParams(signature_type=2)
+            params = BalanceAllowanceParams(signature_type=1)
             raw = await run_clob(clob.get_balance_allowance, params)
             raw_info = f"\n  Raw API: <code>{str(raw)[:100]}</code>"
         except Exception as e:
