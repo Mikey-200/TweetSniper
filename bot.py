@@ -164,6 +164,7 @@ CSV_COLUMNS = [
     "buy_price", "size_shares", "cost_usd", "tp_target", "tp_mult",
     "buy_order_id", "buy_status", "sell_price", "sell_order_id",
     "profit_usd", "profit_pct", "spread_at_entry", "is_fallback_gtc",
+    "token_id", "market_key",   # added for cross-restart position restore
 ]
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1484,6 +1485,8 @@ async def process_market(app: Application, market: dict,
             "profit_pct":      "",
             "spread_at_entry": round(spread, 4),
             "is_fallback_gtc": is_fallback_gtc,
+            "token_id":        token_id,
+            "market_key":      market_key,
         }
         append_csv_row(row)
 
@@ -2527,10 +2530,174 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 # SECTION 20 — APPLICATION STARTUP
 # ──────────────────────────────────────────────────────────────────────
 
+async def restore_positions_from_csv() -> int:
+    """On startup, rebuild open_positions from CSV rows with buy_status=OPEN.
+
+    Each row is verified against the CLOB API to confirm the order still exists
+    and hasn't been filled/cancelled outside the bot.  Returns the count of
+    successfully restored positions.
+    """
+    global session_counter
+    rows = load_csv_rows()
+    restored = 0
+
+    for row in rows:
+        if row.get("buy_status", "") != "OPEN":
+            continue
+
+        order_id  = row.get("buy_order_id", "")
+        token_id  = row.get("token_id", "")
+        if not order_id or not token_id:
+            log.info("Skipping CSV row — missing order_id or token_id: %s", row)
+            continue
+        if order_id in open_positions:
+            continue  # already restored
+
+        # Verify order is still open on the CLOB
+        try:
+            live = await run_clob(clob.get_order, order_id)
+            status = (live.get("status") or "").upper()
+            if status not in ("LIVE", "OPEN", ""):  # empty = old API; non-empty MATCHED/CANCELED = skip
+                if status in ("MATCHED", "CANCELED", "CANCELLED"):
+                    log.info("Skip restore for %s — CLOB status=%s", order_id[:16], status)
+                    continue
+        except Exception as e:
+            log.warning("Could not verify order %s on CLOB: %s — restoring anyway", order_id[:16], e)
+
+        try:
+            snum       = int(row.get("session_num", 0) or 0)
+            buy_price  = float(row.get("buy_price",  0) or 0)
+            size_shares= float(row.get("size_shares", 0) or 0)
+            tp_target  = float(row.get("tp_target",  buy_price * 2.0) or buy_price * 2.0)
+            tp_mult    = float(row.get("tp_mult",    2.0) or 2.0)
+            market_key = row.get("market_key", row.get("market_question", "")[:30])
+            cost_usd   = float(row.get("cost_usd",   ORDER_SIZE_USD) or ORDER_SIZE_USD)
+        except (ValueError, TypeError):
+            log.warning("Bad numeric data in CSV row, skipping: %s", row)
+            continue
+
+        position = {
+            "session_num":     snum,
+            "order_id":        order_id,
+            "token_id":        token_id,
+            "market_question": row.get("market_question", "Restored position"),
+            "market_key":      market_key,
+            "bucket":          row.get("bucket", "?"),
+            "slot":            int(row.get("slot", 0) or 0),
+            "buy_price":       buy_price,
+            "exec_price":      buy_price,
+            "size_shares":     size_shares,
+            "cost_usd":        cost_usd,
+            "tp_target":       tp_target,
+            "tp_mult":         tp_mult,
+            "buy_order_id":    order_id,
+            "buy_status":      "OPEN",
+            "placed_at":       time.time(),  # age resets on restart — cosmetic only
+            "spread":          0.0,
+            "is_fallback_gtc": False,
+        }
+        open_positions[order_id] = position
+        order_registry[snum]     = order_id
+        if market_key not in open_positions_by_market:
+            open_positions_by_market[market_key] = order_id
+        if snum > session_counter:
+            session_counter = snum
+        restored += 1
+        log.info("Restored position #%d — %s @ $%.4f",
+                 snum, row.get("bucket", "?"), buy_price)
+
+    return restored
+
+
+async def sync_positions_from_clob() -> int:
+    """Fallback: fetch ALL open orders from the CLOB and restore any that
+    aren't already in open_positions (e.g. placed before the CSV had token_id).
+
+    Uses 2× buy price as default TP since we can't recover original strategy metadata.
+    Returns count of newly restored positions.
+    """
+    global session_counter
+    if not clob:
+        return 0
+
+    try:
+        live_orders = await run_clob(clob.get_orders)
+    except Exception as e:
+        log.warning("sync_positions_from_clob: get_orders failed: %s", e)
+        return 0
+
+    restored = 0
+    for o in live_orders:
+        order_id = o.get("id", "")
+        if not order_id or order_id in open_positions:
+            continue
+        status = (o.get("status") or "").upper()
+        if status in ("MATCHED", "CANCELED", "CANCELLED"):
+            continue
+        if (o.get("side") or "").upper() != "BUY":
+            continue
+
+        token_id = str(o.get("asset_id") or o.get("token_id") or "")
+        if not token_id:
+            continue
+
+        try:
+            buy_price   = float(o.get("price", 0) or 0)
+            size_shares = float(o.get("size_matched", 0) or o.get("original_size", 0) or 1.0)
+            if buy_price <= 0:
+                continue
+        except (ValueError, TypeError):
+            continue
+
+        session_counter += 1
+        snum       = session_counter
+        tp_target  = round(buy_price * 2.0, 4)
+        market_key = f"clob_restore_{token_id[:12]}"
+
+        position = {
+            "session_num":     snum,
+            "order_id":        order_id,
+            "token_id":        token_id,
+            "market_question": "Restored from CLOB (pre-fix)",
+            "market_key":      market_key,
+            "bucket":          "unknown (restored)",
+            "slot":            0,
+            "buy_price":       buy_price,
+            "exec_price":      buy_price,
+            "size_shares":     size_shares,
+            "cost_usd":        ORDER_SIZE_USD,
+            "tp_target":       tp_target,
+            "tp_mult":         2.0,
+            "buy_order_id":    order_id,
+            "buy_status":      "OPEN",
+            "placed_at":       time.time(),
+            "spread":          0.0,
+            "is_fallback_gtc": False,
+        }
+        open_positions[order_id] = position
+        order_registry[snum]     = order_id
+        open_positions_by_market[market_key] = order_id
+        restored += 1
+        log.info("CLOB sync restored order %s @ $%.4f TP=$%.4f",
+                 order_id[:16], buy_price, tp_target)
+
+    return restored
+
+
 async def post_init(app: Application) -> None:
     """Launch all background tasks after the bot is initialized."""
     log.info("Starting TweetSniper background tasks…")
     init_csv()
+
+    # Restore open positions from CSV (primary) then CLOB (fallback)
+    csv_restored  = await restore_positions_from_csv()
+    clob_restored = await sync_positions_from_clob()
+    total_restored = csv_restored + clob_restored
+    restore_note = (
+        f"\n  ♻️ Restored {total_restored} open position(s) "
+        f"({csv_restored} from CSV, {clob_restored} from CLOB)"
+        if total_restored else ""
+    )
 
     dry_note = " [DRY RUN]" if DRY_RUN else ""
     try:
@@ -2543,7 +2710,8 @@ async def post_init(app: Application) -> None:
                 f"  TP at:        {TP_SLOTS[0]}×\n"
                 f"  Fast scan:    every {MARKET_POLL_SECS}s\n"
                 f"  Ongoing scan: {'every ' + str(ONGOING_RESCAN_SECS) + 's' if SCAN_ONGOING_MARKETS else 'disabled'}\n"
-                f"  CLOB:         {'✅ authenticated' if clob else '❌ not connected'}\n"
+                f"  CLOB:         {'✅ authenticated' if clob else '❌ not connected'}"
+                f"{restore_note}\n"
                 f"\n⏳ Fetching current Elon tweet markets…\n"
                 f"Commands: /markets /scan /pace /orders /status"
             ),
