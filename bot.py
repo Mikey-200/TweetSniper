@@ -1707,7 +1707,7 @@ async def ws_price_monitor(app: Application) -> None:
                 # Subscribe to market channel
                 sub_msg = json.dumps({
                     "assets_ids": token_ids,
-                    "type":       "market",
+                    "type":       "MARKET",
                 })
                 await ws.send(sub_msg)
                 log.info("WS: Subscribed to %d tokens", len(token_ids))
@@ -1779,7 +1779,7 @@ async def ws_price_monitor(app: Application) -> None:
                     new_ids = [pos["token_id"] for pos in open_positions.values()]
                     if set(new_ids) != set(token_ids):
                         token_ids = new_ids
-                        sub_msg = json.dumps({"assets_ids": new_ids, "type": "market"})
+                        sub_msg = json.dumps({"assets_ids": new_ids, "type": "MARKET"})
                         await ws.send(sub_msg)
                         log.debug("WS: Re-subscribed to %d tokens", len(new_ids))
 
@@ -2581,11 +2581,11 @@ async def load_traded_token_ids() -> int:
 
         # ── Source 3: CLOB trade history ─────────────────────────────────
         try:
-            from py_clob_client.clob_types import TradeParams
             trades = await run_clob(clob.get_trades)
             for t in trades:
-                # Trade objects have 'asset_id' for the conditional token bought
-                tid = str(t.get("asset_id") or t.get("market") or "").strip()
+                # asset_id is the conditional token ID for this trade
+                # NOTE: t.get('market') is the condition ID (0x hex), NOT the token ID
+                tid = str(t.get("asset_id", "")).strip()
                 if tid:
                     traded_token_ids.add(tid)
             log.info("Loaded %d traded token IDs from CLOB trade history", len(trades))
@@ -2624,10 +2624,10 @@ async def restore_positions_from_csv() -> int:
         try:
             live = await run_clob(clob.get_order, order_id)
             status = (live.get("status") or "").upper()
-            if status not in ("LIVE", "OPEN", ""):  # empty = old API; non-empty MATCHED/CANCELED = skip
-                if status in ("MATCHED", "CANCELED", "CANCELLED"):
-                    log.info("Skip restore for %s — CLOB status=%s", order_id[:16], status)
-                    continue
+            # CLOB status values: LIVE (open), MATCHED (filled), CANCELED/CANCELLED
+            if status in ("MATCHED", "CANCELED", "CANCELLED"):
+                log.info("Skip restore for %s — CLOB status=%s", order_id[:16], status)
+                continue
         except Exception as e:
             log.warning("Could not verify order %s on CLOB: %s — restoring anyway", order_id[:16], e)
 
@@ -2710,7 +2710,9 @@ async def sync_positions_from_clob() -> int:
 
         try:
             buy_price   = float(o.get("price", 0) or 0)
-            size_shares = float(o.get("size_matched", 0) or o.get("original_size", 0) or 1.0)
+            # original_size = total shares ordered; size_matched = filled so far
+            # For a live GTC order not yet filled: size_matched=0, original_size=full
+            size_shares = float(o.get("original_size", 0) or o.get("size_matched", 0) or 1.0)
             if buy_price <= 0:
                 continue
         except (ValueError, TypeError):
