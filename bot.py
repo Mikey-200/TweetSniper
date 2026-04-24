@@ -620,18 +620,18 @@ def select_buckets(tokens: list, pace: dict) -> list:
     if center_idx is None:
         center_idx = len(filtered) - 1
 
-    # STRATEGY: CENTER first, then CENTER+1, then CENTER+2 (upward bias)
-    # Elon has been trending slower recently, but still often overshoots,
-    # so we cover the target bucket + the two above it.
-    # ORDER of execution: CENTER placed first (highest conviction).
+    # STRATEGY: CENTER first (highest conviction), then CENTER-1, then CENTER-2
+    # Elon has been slow lately — actual count tends to land at or below projection.
+    # Buying the 2 buckets below the center captures the likely undershoot range.
+    # ORDER of execution: CENTER placed first so lowest-price entries follow.
     selected = []
-    selected.append(filtered[center_idx])            # 0: center (placed first)
-    if center_idx + 1 < len(filtered):
-        selected.append(filtered[center_idx + 1])   # 1: one above
-    if center_idx + 2 < len(filtered):
-        selected.append(filtered[center_idx + 2])   # 2: two above
+    selected.append(filtered[center_idx])                # 0: center  (placed first)
+    if center_idx - 1 >= 0:
+        selected.append(filtered[center_idx - 1])        # 1: one below center
+    if center_idx - 2 >= 0:
+        selected.append(filtered[center_idx - 2])        # 2: two below center
 
-    # Build result: slot 0 = center, slot 1 = +1, slot 2 = +2
+    # Build result: slot 0 = center, slot 1 = center-1, slot 2 = center-2
     result = []
     for slot_idx, (low, high, token_id, label) in enumerate(selected):
         result.append((token_id, label, slot_idx, low, high))
