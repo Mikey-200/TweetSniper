@@ -113,6 +113,7 @@ SKIP_MARGIN_MULTIPLIER = float(os.getenv("SKIP_MARGIN_MULTIPLIER", "1.5"))
 
 # === Position Management ===
 MAX_MARKETS_PER_CYCLE  = int(os.getenv("MAX_MARKETS_PER_CYCLE",  "2"))   # max markets to enter per scan cycle
+MAX_OPEN_ORDERS        = int(os.getenv("MAX_OPEN_ORDERS",         "6"))   # hard cap on concurrent open positions
 STOP_LOSS_PCT          = float(os.getenv("STOP_LOSS_PCT",         "0.60")) # cut loss when down 60% (price at 40% of entry)
 
 # === Take-Profit Multipliers (per slot) ===
@@ -182,6 +183,10 @@ open_positions: dict = {}
 
 # Session order registry: {session_num (int) → order_id (str)}
 order_registry: dict = {}
+
+# Token IDs already bought (ever) — populated from CLOB trade history on startup
+# Prevents duplicate buys across redeploys
+traded_token_ids: set = set()
 
 # Sequential session counter
 session_counter = 0
@@ -615,19 +620,18 @@ def select_buckets(tokens: list, pace: dict) -> list:
     if center_idx is None:
         center_idx = len(filtered) - 1
 
-    # NEW STRATEGY: CENTER + 1 bucket below + 1 bucket above
-    # This is symmetric around the projected count, giving 3 positions:
-    #   [center-1]  (lower neighbour — catches slight undershoot)
-    #   [center]    (highest probability — directly on projection)
-    #   [center+1]  (upper neighbour — catches slight overshoot)
+    # STRATEGY: CENTER first, then CENTER+1, then CENTER+2 (upward bias)
+    # Elon has been trending slower recently, but still often overshoots,
+    # so we cover the target bucket + the two above it.
+    # ORDER of execution: CENTER placed first (highest conviction).
     selected = []
-    if center_idx > 0:
-        selected.append(filtered[center_idx - 1])   # 1 below center
-    selected.append(filtered[center_idx])            # center
+    selected.append(filtered[center_idx])            # 0: center (placed first)
     if center_idx + 1 < len(filtered):
-        selected.append(filtered[center_idx + 1])   # 1 above center
+        selected.append(filtered[center_idx + 1])   # 1: one above
+    if center_idx + 2 < len(filtered):
+        selected.append(filtered[center_idx + 2])   # 2: two above
 
-    # Build result: slot 0 = below, slot 1 = center, slot 2 = above
+    # Build result: slot 0 = center, slot 1 = +1, slot 2 = +2
     result = []
     for slot_idx, (low, high, token_id, label) in enumerate(selected):
         result.append((token_id, label, slot_idx, low, high))
@@ -1348,6 +1352,18 @@ async def process_market(app: Application, market: dict,
     for token_id, label, slot_idx, low, high in selected_tokens:
         tp_mult = TP_SLOTS[slot_idx] if slot_idx < len(TP_SLOTS) else 2.0
 
+        # Hard cap: never hold more than MAX_OPEN_ORDERS simultaneously
+        if len(open_positions) >= MAX_OPEN_ORDERS:
+            await send_message(app,
+                f"🚫 Open-order cap reached ({MAX_OPEN_ORDERS}) — "
+                f"skipping bucket <b>{label}</b> until a position closes.")
+            break
+
+        # Duplicate guard: skip if this token was already bought (any session)
+        if token_id in traded_token_ids:
+            log.info("Skipping %s — already traded token %s…", label, token_id[:16])
+            continue
+
         # Per-bucket balance check (balance changes after each fill)
         current_balance = await get_proxy_balance()
         if current_balance < ORDER_SIZE_USD:
@@ -1455,6 +1471,9 @@ async def process_market(app: Application, market: dict,
 
         open_positions[order_id] = position
         order_registry[snum]     = order_id
+
+        # Mark this token as bought — prevents re-buying across restarts
+        traded_token_ids.add(token_id)
 
         # Mark market as traded (duplicate guard)
         if market_key not in open_positions_by_market:
@@ -2530,6 +2549,54 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 # SECTION 20 — APPLICATION STARTUP
 # ──────────────────────────────────────────────────────────────────────
 
+async def load_traded_token_ids() -> int:
+    """Populate traded_token_ids from CLOB trade history + open orders on startup.
+
+    Sources (in priority order):
+    1. CSV file  — fast, no API call, covers all sessions with token_id column
+    2. CLOB open orders  — clob.get_orders()  → asset_id per order
+    3. CLOB trade history — clob.get_trades() → asset per completed trade
+
+    Returns total count of token IDs loaded.
+    """
+    global traded_token_ids
+
+    # ── Source 1: CSV (instant, no network) ─────────────────────────────
+    for row in load_csv_rows():
+        tid = row.get("token_id", "").strip()
+        if tid:
+            traded_token_ids.add(tid)
+
+    # ── Source 2: CLOB open orders ───────────────────────────────────────
+    if clob:
+        try:
+            open_orders = await run_clob(clob.get_orders)
+            for o in open_orders:
+                tid = str(o.get("asset_id") or o.get("token_id") or "").strip()
+                if tid:
+                    traded_token_ids.add(tid)
+            log.info("Loaded %d traded token IDs from CLOB open orders", len(open_orders))
+        except Exception as e:
+            log.warning("Could not load open orders for dedup: %s", e)
+
+        # ── Source 3: CLOB trade history ─────────────────────────────────
+        try:
+            from py_clob_client.clob_types import TradeParams
+            trades = await run_clob(clob.get_trades)
+            for t in trades:
+                # Trade objects have 'asset_id' for the conditional token bought
+                tid = str(t.get("asset_id") or t.get("market") or "").strip()
+                if tid:
+                    traded_token_ids.add(tid)
+            log.info("Loaded %d traded token IDs from CLOB trade history", len(trades))
+        except Exception as e:
+            log.warning("Could not load trade history for dedup: %s", e)
+
+    total = len(traded_token_ids)
+    log.info("traded_token_ids populated: %d unique token IDs (no re-buy guard active)", total)
+    return total
+
+
 async def restore_positions_from_csv() -> int:
     """On startup, rebuild open_positions from CSV rows with buy_status=OPEN.
 
@@ -2688,6 +2755,9 @@ async def post_init(app: Application) -> None:
     """Launch all background tasks after the bot is initialized."""
     log.info("Starting TweetSniper background tasks…")
     init_csv()
+
+    # Load dedup set FIRST so no token is re-bought on restart
+    await load_traded_token_ids()
 
     # Restore open positions from CSV (primary) then CLOB (fallback)
     csv_restored  = await restore_positions_from_csv()
