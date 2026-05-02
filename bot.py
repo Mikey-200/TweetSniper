@@ -577,12 +577,19 @@ def kelly_bet_size(p_fused: float, price: float,
 
     Returns 0.0 to skip the bet when edge is negative.
 
-    Uses quarter-Kelly (KELLY_FRACTION=0.25) — conservative setting that
-    prevents ruin even if our probability estimate is slightly off.
+    Uses KELLY_FRACTION (default 0.25 = quarter-Kelly) — conservative multiplier
+    that protects bankroll even when our probability estimate is slightly off.
 
-    Formula:  edge = p × (1/price) − 1
-              f*   = edge / (1/price − 1)
-              bet  = balance × f* × KELLY_FRACTION × 4
+    Formula:  edge    = p_fused × (1/price) − 1       (expected value per $1)
+              f_full  = edge / (1/price − 1)           (full Kelly fraction)
+              f_safe  = f_full × KELLY_FRACTION        (scaled down for safety)
+              bet     = balance × f_safe               (absolute bet size)
+
+    Example with $5 balance, price=$0.12, p_fused=0.65:
+      edge   = 0.65/0.12 − 1 = 4.42
+      f_full = 4.42 / 7.33   = 0.60  (60% full Kelly)
+      f_safe = 0.60 × 0.25   = 0.15  (15% quarter-Kelly)
+      bet    = $5 × 0.15     = $0.75 → rounds up to $1 minimum
     """
     if price <= 0 or price >= 1 or p_fused <= 0:
         return max_bet  # no data → use full size
@@ -593,11 +600,11 @@ def kelly_bet_size(p_fused: float, price: float,
     if edge <= 0:
         return 0.0   # negative edge → skip → protect capital
     f_full = edge / b
-    f_safe = f_full * KELLY_FRACTION * 4.0  # KELLY_FRACTION=0.25 → full Kelly at ×4
+    f_safe = f_full * KELLY_FRACTION    # quarter-Kelly when KELLY_FRACTION=0.25
     bet    = balance * f_safe
     bet    = min(bet, max_bet)
     if bet < 1.0:
-        return 1.0 if edge > 0.08 else 0.0  # minimum $1 only if edge is meaningful
+        return 1.0 if edge > 0.08 else 0.0  # only pay $1 minimum if edge is meaningful
     return round(bet, 2)
 
 
