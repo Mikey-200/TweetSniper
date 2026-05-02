@@ -28,6 +28,7 @@ import re
 import sys
 import time
 from datetime import datetime, timezone, timedelta
+from statistics import NormalDist
 from typing import Optional
 
 import httpx
@@ -299,6 +300,14 @@ _xtracker_cache: Optional[list] = None   # all trackings (raw, no stats)
 _xtracker_cache_ts: float = 0.0           # unix timestamp of last fetch
 _XTRACKER_CACHE_TTL = 600                 # refresh every 10 minutes
 
+# Historical rate cache (EWMA of past completed periods)
+_hist_rate_cache: Optional[float] = None  # tweets/hr (EWMA)
+_hist_rate_cache_ts: float = 0.0
+_HIST_RATE_CACHE_TTL = 86400              # recompute every 24 hours
+_HIST_RATE_DEFAULT   = 1.4               # fallback if no history yet (tweets/hr)
+_BAYESIAN_BETA0      = 48.0              # prior equivalent hours (strength of prior)
+_CREDIBILITY_K       = 30.0              # tweets needed for 50% credibility weight
+
 
 async def _load_xtracker_trackings() -> list:
     """Load all XTracker tracking periods for @elonmusk, with 10-min cache.
@@ -331,6 +340,129 @@ async def _load_xtracker_trackings() -> list:
         log.error("XTracker load_trackings error: %s", e)
 
     return _xtracker_cache or []
+
+
+async def compute_historical_rate() -> float:
+    """Auto-compute Elon's historical tweet rate (tweets/hr) from past XTracker periods.
+
+    Fetches the last 5 COMPLETED tracking periods, computes each period's rate,
+    then returns an EWMA-weighted average (most recent weighted highest, α=0.4).
+
+    Fully automatic — no user input needed. Cached for 24 hours.
+    Falls back to _HIST_RATE_DEFAULT (1.4/hr) if data unavailable.
+    """
+    global _hist_rate_cache, _hist_rate_cache_ts
+    now = time.time()
+    if _hist_rate_cache is not None and (now - _hist_rate_cache_ts) < _HIST_RATE_CACHE_TTL:
+        return _hist_rate_cache
+
+    trackings = await _load_xtracker_trackings()
+    now_utc = datetime.now(timezone.utc)
+
+    # Find completed trackings (endDate in the past)
+    completed = []
+    for t in trackings:
+        try:
+            end = datetime.fromisoformat(t.get("endDate", "").replace("Z", "+00:00"))
+            start = datetime.fromisoformat(t.get("startDate", "").replace("Z", "+00:00"))
+            if end < now_utc:
+                duration_hrs = max(1.0, (end - start).total_seconds() / 3600)
+                completed.append((end, duration_hrs, t))
+        except Exception:
+            continue
+
+    # Sort by end date — most recent first
+    completed.sort(key=lambda x: x[0], reverse=True)
+    completed = completed[:7]  # use last 7 completed periods
+
+    if not completed:
+        log.warning("compute_historical_rate: no completed periods found — using default %.2f/hr",
+                    _HIST_RATE_DEFAULT)
+        _hist_rate_cache = _HIST_RATE_DEFAULT
+        _hist_rate_cache_ts = now
+        return _HIST_RATE_DEFAULT
+
+    # Fetch stats for each completed period and compute rates
+    rates = []
+    async with httpx.AsyncClient(timeout=15) as http:
+        for end_dt, duration_hrs, t in completed:
+            try:
+                tracking_id = t["id"]
+                r = await http.get(
+                    f"{XTRACKER_API}/trackings/{tracking_id}",
+                    params={"includeStats": "true"},
+                )
+                r.raise_for_status()
+                body = r.json()
+                data = body.get("data", body) if isinstance(body, dict) else body
+                stats = data.get("stats", {})
+                total = float(stats.get("total", 0))
+                if total > 0 and duration_hrs > 0:
+                    rate = total / duration_hrs
+                    rates.append(rate)
+                    log.debug("Historical period '%s': %.0f tweets / %.0fh = %.2f/hr",
+                              t.get("title", ""), total, duration_hrs, rate)
+            except Exception as e:
+                log.debug("compute_historical_rate: skipping period %s: %s", t.get("id", "?"), e)
+                continue
+
+    if not rates:
+        log.warning("compute_historical_rate: all fetches failed — using default")
+        _hist_rate_cache = _HIST_RATE_DEFAULT
+        _hist_rate_cache_ts = now
+        return _HIST_RATE_DEFAULT
+
+    # EWMA: most recent period gets highest weight
+    # rates[0] = most recent, rates[-1] = oldest
+    alpha = 0.4
+    ewma = rates[0]
+    for r in rates[1:]:
+        ewma = alpha * ewma + (1 - alpha) * r
+
+    log.info("Historical EWMA rate: %.3f/hr from %d periods (individual: %s)",
+             ewma, len(rates), [f"{r:.2f}" for r in rates])
+    _hist_rate_cache = ewma
+    _hist_rate_cache_ts = now
+    return ewma
+
+
+def compute_bucket_probabilities(tokens: list, mu: float, sigma: float) -> list:
+    """Compute P(bucket wins) for every token bucket using Normal approximation.
+
+    Args:
+        tokens:  list of {token_id, outcome, price} from process_market
+        mu:      projected final tweet count (point estimate)
+        sigma:   standard deviation of projection uncertainty
+
+    Returns:
+        list of (prob, token_id, label, low, high) sorted by prob descending
+    """
+    if sigma <= 0:
+        sigma = 1.0  # safety guard
+
+    nd = NormalDist(mu=mu, sigma=sigma)
+    results = []
+
+    for t in tokens:
+        label = t.get("outcome", "")
+        bounds = parse_bucket_label(label)
+        if bounds is None:
+            continue
+        lo, hi = bounds
+
+        # P(lo ≤ X ≤ hi) with continuity correction
+        if hi == 9999:
+            # Open-ended bucket: P(X ≥ lo - 0.5)
+            prob = 1.0 - nd.cdf(lo - 0.5)
+        else:
+            prob = nd.cdf(hi + 0.5) - nd.cdf(lo - 0.5)
+
+        prob = max(0.0, min(1.0, prob))
+        results.append((prob, t["token_id"], label, lo, hi))
+
+    # Sort by probability descending
+    results.sort(key=lambda x: x[0], reverse=True)
+    return results
 
 
 async def fetch_elon_pace(market_slug: str = "") -> Optional[dict]:
@@ -444,18 +576,58 @@ async def fetch_elon_pace(market_slug: str = "") -> Optional[dict]:
             end_dt   = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
             hours_elapsed   = max(0.01, (now_utc - start_dt).total_seconds() / 3600)
             hours_remaining = max(0.0,  (end_dt   - now_utc).total_seconds() / 3600)
+            tracking_duration_hrs = max(1.0, (end_dt - start_dt).total_seconds() / 3600)
         except Exception:
-            # Fall back to XTracker's coarse day counts
-            hours_elapsed   = float(stats.get("daysElapsed",   1)) * 24
-            hours_remaining = float(stats.get("daysRemaining", 0)) * 24
+            hours_elapsed         = float(stats.get("daysElapsed",   1)) * 24
+            hours_remaining       = float(stats.get("daysRemaining", 0)) * 24
+            tracking_duration_hrs = hours_elapsed + hours_remaining
 
-        # Hourly rate (more accurate near end-of-market than daily rate)
-        hourly_avg = total / hours_elapsed
-        daily_avg  = hourly_avg * 24   # for display only
+        # ── SABP: Period mismatch detection ──────────────────────────────
+        # If the tracking covers a much longer period than the market (e.g.
+        # a monthly tracking matched to a weekly market), the tweet count
+        # and hourly_avg will be wrong. Detect and flag this.
+        # We use the market's own endDate if we know it, otherwise we check
+        # the tracking's own duration vs a typical weekly market (~168 hrs).
+        period_mismatch = False
+        expected_market_hrs = 168.0  # typical weekly Elon market
+        if tracking_duration_hrs > expected_market_hrs * 2.5:
+            period_mismatch = True
+            log.warning(
+                "SABP: Period mismatch detected — tracking covers %.0fh but market "
+                "is typically %.0fh. Using historical rate only.",
+                tracking_duration_hrs, expected_market_hrs,
+            )
 
-        # Early-period bias (sparse data in first 2h)
-        bias      = 0.5 * hourly_avg * 24 if hours_elapsed < 48 else 0.0
-        projected = total + (hourly_avg * hours_remaining) + bias
+        # ── SABP: Auto-compute λ_hist (EWMA of past periods) ─────────────
+        lambda_hist = await compute_historical_rate()
+
+        # ── SABP: Bayesian Gamma-Poisson posterior rate ───────────────────
+        # Prior:     λ ~ Gamma(α₀, β₀)  where α₀ = λ_hist × β₀
+        # Posterior: λ | data ~ Gamma(α₀ + n, β₀ + h_e)
+        # Posterior mean: λ̂ = (α₀ + n) / (β₀ + h_e)
+        beta0  = _BAYESIAN_BETA0                  # prior strength in hours
+        alpha0 = lambda_hist * beta0              # prior pseudo-count
+
+        if period_mismatch:
+            # Tracking doesn't match market — ignore observed rate entirely
+            lambda_posterior = lambda_hist
+            lambda_obs       = lambda_hist        # display only
+            credibility_z    = 0.0
+        else:
+            lambda_obs       = total / hours_elapsed
+            lambda_posterior = (alpha0 + total) / (beta0 + hours_elapsed)
+            # Credibility factor: how much we trust current data vs history
+            credibility_z    = total / (total + _CREDIBILITY_K)
+
+        # ── SABP: Projection with uncertainty (σ) ────────────────────────
+        # Point estimate: n + λ̂ × h_r
+        # Uncertainty: σ = √(λ̂ × h_r)  — Poisson variance of future tweets
+        projected_remaining = lambda_posterior * hours_remaining
+        projected           = total + projected_remaining
+        sigma               = math.sqrt(max(1.0, projected_remaining))
+
+        # Keep legacy bias key False (Bayesian prior replaces the old bias)
+        daily_avg = lambda_posterior * 24
 
         if   projected < 200:  tier = "🟢 Low"
         elif projected < 400:  tier = "🟡 Medium"
@@ -463,34 +635,43 @@ async def fetch_elon_pace(market_slug: str = "") -> Optional[dict]:
         else:                  tier = "🔴 Very High"
 
         log.info(
-            "XTracker: total=%d  elapsed=%.1fh  remaining=%.1fh  "
-            "rate=%.2f/h  projected=%d  pct=%.0f%%",
+            "SABP: total=%d  h_e=%.1f  h_r=%.1f  "
+            "λ_hist=%.2f  λ_obs=%.2f  λ̂=%.2f  Z=%.2f  "
+            "projected=%.0f±%.0f  mismatch=%s",
             total, hours_elapsed, hours_remaining,
-            hourly_avg, projected, pct_complete,
+            lambda_hist, lambda_obs, lambda_posterior, credibility_z,
+            projected, sigma, period_mismatch,
         )
 
         return {
-            "tracking_id":    tracking_id,
-            "title":          tracking.get("title", ""),
-            "start_date":     start_date,
-            "end_date":       end_date,
-            "total":          total,
-            "hourly_avg":     hourly_avg,
-            "daily_avg":      daily_avg,
-            "hours_elapsed":  hours_elapsed,
-            "hours_remaining": hours_remaining,
-            # Legacy keys kept so existing code using days_* still works
-            "days_elapsed":   hours_elapsed / 24,
-            "days_remaining": hours_remaining / 24,
-            "projected":      projected,
-            "pct_complete":   pct_complete,
-            "tier":           tier,
-            "has_bias":       bias > 0,
+            "tracking_id":      tracking_id,
+            "title":            tracking.get("title", ""),
+            "start_date":       start_date,
+            "end_date":         end_date,
+            "total":            total,
+            "hourly_avg":       lambda_posterior,   # posterior rate (was raw rate)
+            "daily_avg":        daily_avg,
+            "hours_elapsed":    hours_elapsed,
+            "hours_remaining":  hours_remaining,
+            "days_elapsed":     hours_elapsed / 24,
+            "days_remaining":   hours_remaining / 24,
+            "projected":        projected,
+            "sigma":            sigma,
+            "pct_complete":     pct_complete,
+            "tier":             tier,
+            "has_bias":         False,              # replaced by Bayesian prior
+            # SABP diagnostics (for Telegram /pace display)
+            "lambda_hist":      lambda_hist,
+            "lambda_obs":       lambda_obs,
+            "lambda_posterior": lambda_posterior,
+            "credibility_z":    credibility_z,
+            "period_mismatch":  period_mismatch,
         }
 
     except Exception as e:
         log.error("fetch_elon_pace error: %s", e)
         return None
+
 
 
 
@@ -543,26 +724,29 @@ def parse_bucket_label(label: str) -> tuple:
 
 
 def select_buckets(tokens: list, pace: dict) -> list:
-    """Apply the expert bucket selection strategy.
+    """SABP probability-based bucket selection.
 
-    Strategy (from Polymarket research by Terry Lee, March 2026):
-    1. Parse all bucket labels into numeric ranges
-    2. Skip bucket[0] (lowest range — Elon never tweets that little)
-    3. Apply SKIP_MARGIN logic: skip bucket if projected > ceiling + width*SKIP_MARGIN
-    4. Find CENTER bucket (range that contains projected_final)
-    5. Select CENTER + up to (BUCKETS_TO_BUY-1) buckets above center
-    6. Buy the CENTER bucket first (highest probability per research)
+    Uses the Bayesian posterior projection (mu, sigma) from fetch_elon_pace()
+    to compute P(bucket wins) for every token via NormalDist, then selects
+    the top BUCKETS_TO_BUY buckets by probability.
+
+    The highest-probability bucket (center) is always slot 0 so it is placed
+    first. The next two highest are slots 1 and 2.
+
+    Falls back to legacy center-based selection if pace has no sigma.
 
     Args:
-        tokens: list of {token_id, outcome (label)} dicts from Gamma API
-        pace: dict from fetch_elon_pace()
+        tokens: list of {token_id, outcome, price} dicts from Gamma API
+        pace:   dict from fetch_elon_pace() — must contain 'projected' and 'sigma'
 
     Returns:
         list of (token_id, label, slot_index, low_bound, high_bound)
+        ordered: highest-probability first
     """
     projected = pace["projected"]
+    sigma     = pace.get("sigma", 0.0)
 
-    # Parse all tokens into (low, high, token_id, label)
+    # Parse all tokens into (low, high, token_id, label), skip lowest bucket
     parsed = []
     for t in tokens:
         label = t.get("outcome", "")
@@ -571,78 +755,79 @@ def select_buckets(tokens: list, pace: dict) -> list:
             continue
         low, high = bounds
         parsed.append((low, high, t["token_id"], label))
-
-    # Sort by lower bound ascending
     parsed.sort(key=lambda x: x[0])
 
     if not parsed:
         return []
 
-    # Always skip bucket[0] (the lowest range — Elon's never that quiet)
+    # Always skip bucket[0] (the very lowest — Elon never tweets that little)
     candidates = parsed[1:]
+    if not candidates:
+        candidates = parsed  # safety: if only 1 bucket, use it
 
-    # Apply SKIP_MARGIN logic
-    # Skip a bucket if projected > bucket_ceiling + (bucket_width × SKIP_MARGIN)
-    # This prevents buying buckets whose ceiling is well below projection
-    filtered = []
-    for low, high, token_id, label in candidates:
-        if high == 9999:
-            # Open-ended bucket (e.g. "580+") — never skip this
-            filtered.append((low, high, token_id, label))
-            continue
-        bucket_width = high - low + 1
-        skip_threshold = high + (bucket_width * SKIP_MARGIN_MULTIPLIER)
-        if projected <= skip_threshold:
-            filtered.append((low, high, token_id, label))
-        else:
-            log.debug("Skip bucket '%s': projected %.0f > threshold %.0f",
-                      label, projected, skip_threshold)
+    # ── SABP: Probability-based selection ────────────────────────────────
+    if sigma > 0:
+        # Rebuild candidates as token dicts so compute_bucket_probabilities works
+        cand_tokens = [
+            {"token_id": tid, "outcome": label}
+            for (low, high, tid, label) in candidates
+        ]
+        probs = compute_bucket_probabilities(cand_tokens, mu=projected, sigma=sigma)
+        # probs = [(prob, token_id, label, lo, hi), ...] sorted descending
 
-    if not filtered:
-        log.warning("All buckets skipped by SKIP_MARGIN logic — falling back to center")
-        filtered = candidates  # fallback: use all candidates
+        if not probs:
+            return []
 
-    # Find CENTER bucket: the one whose range contains projected_final
+        # Take top BUCKETS_TO_BUY by probability
+        top = probs[:BUCKETS_TO_BUY]
+
+        # Build result: slot 0 = highest probability (placed first)
+        result = []
+        for slot_idx, (prob, token_id, label, lo, hi) in enumerate(top):
+            result.append((token_id, label, slot_idx, lo, hi))
+
+        log.info(
+            "SABP bucket selection: μ=%.0f σ=%.1f → %s",
+            projected, sigma,
+            [(f"{lbl}({p*100:.0f}%)") for (p, tid, lbl, lo, hi) in probs[:BUCKETS_TO_BUY]],
+        )
+        return result
+
+    # ── Legacy fallback (no sigma available) ─────────────────────────────
+    log.warning("select_buckets: no sigma in pace — using legacy center-based selection")
+
+    # Find CENTER bucket containing projected
     center_idx = None
-    for i, (low, high, token_id, label) in enumerate(filtered):
+    for i, (low, high, token_id, label) in enumerate(candidates):
         if low <= projected <= high or (high == 9999 and projected >= low):
             center_idx = i
             break
-
-    # If no bucket contains projected exactly, find nearest above projected
     if center_idx is None:
-        for i, (low, high, token_id, label) in enumerate(filtered):
+        for i, (low, high, token_id, label) in enumerate(candidates):
             if low > projected:
                 center_idx = i
                 break
-
-    # Fallback: take the highest bucket
     if center_idx is None:
-        center_idx = len(filtered) - 1
+        center_idx = len(candidates) - 1
 
-    # STRATEGY: CENTER first (highest conviction), then CENTER-1, then CENTER-2
-    # Elon has been slow lately — actual count tends to land at or below projection.
-    # Buying the 2 buckets below the center captures the likely undershoot range.
-    # ORDER of execution: CENTER placed first so lowest-price entries follow.
-    selected = []
-    selected.append(filtered[center_idx])                # 0: center  (placed first)
+    selected = [candidates[center_idx]]
     if center_idx - 1 >= 0:
-        selected.append(filtered[center_idx - 1])        # 1: one below center
+        selected.append(candidates[center_idx - 1])
     if center_idx - 2 >= 0:
-        selected.append(filtered[center_idx - 2])        # 2: two below center
+        selected.append(candidates[center_idx - 2])
 
-    # Build result: slot 0 = center, slot 1 = center-1, slot 2 = center-2
-    result = []
-    for slot_idx, (low, high, token_id, label) in enumerate(selected):
-        result.append((token_id, label, slot_idx, low, high))
-
-    return result
+    return [(tid, lbl, si, lo, hi)
+            for si, (lo, hi, tid, lbl) in enumerate(selected)]
 
 
 def describe_bucket_analysis(tokens: list, pace: dict) -> str:
-    """Generate a human-readable bucket analysis for the pre-buy alert."""
+    """Generate a probability-annotated bucket analysis for the pre-buy alert."""
     projected = pace["projected"]
+    sigma     = pace.get("sigma", 0.0)
     lines = []
+
+    if sigma > 0:
+        nd = NormalDist(mu=projected, sigma=sigma)
 
     parsed = []
     for t in tokens:
@@ -656,20 +841,27 @@ def describe_bucket_analysis(tokens: list, pace: dict) -> str:
 
     for i, (low, high, price_hint, label) in enumerate(parsed):
         if i == 0:
-            lines.append(f"  ⛔ {label:15s}  [skipped — always too low]")
+            lines.append(f"  ⛔ {label:15s}  [always skipped]")
             continue
-        if high == 9999:
-            skip_threshold = None
-        else:
-            width = high - low + 1
-            skip_threshold = high + (width * SKIP_MARGIN_MULTIPLIER)
 
-        if skip_threshold is not None and projected > skip_threshold:
-            lines.append(f"  ❌ {label:15s}  [skip: proj {projected:.0f} > thresh {skip_threshold:.0f}]")
-        elif low <= projected <= high or (high == 9999 and projected >= low):
-            lines.append(f"  🎯 {label:15s}  [CENTER — projection {projected:.0f} is here]")
+        # Compute probability if we have sigma
+        if sigma > 0:
+            if high == 9999:
+                prob = 1.0 - nd.cdf(low - 0.5)
+            else:
+                prob = nd.cdf(high + 0.5) - nd.cdf(low - 0.5)
+            prob_str = f"  {prob*100:4.1f}%"
         else:
-            lines.append(f"  ✅ {label:15s}  [within range]")
+            prob_str = ""
+
+        if low <= projected <= high or (high == 9999 and projected >= low):
+            lines.append(f"  🎯 {label:15s}{prob_str}  [PEAK — proj {projected:.0f} here]")
+        elif sigma > 0 and prob > 0.10:
+            lines.append(f"  ✅ {label:15s}{prob_str}  [in range]")
+        elif sigma > 0 and prob < 0.02:
+            lines.append(f"  ⬜ {label:15s}{prob_str}  [unlikely]")
+        else:
+            lines.append(f"  ✅ {label:15s}{prob_str}")
 
     return "\n".join(lines[:20])  # cap UI length
 
@@ -1050,41 +1242,70 @@ async def send_message(app: Application, text: str, **kwargs) -> None:
 
 async def send_pre_buy_alert(app: Application, market: dict, pace: Optional[dict],
                               tokens: list, planned: list, is_ongoing: bool) -> None:
-    """Send a clean, simple pre-trade announcement before placing any orders."""
+    """Send a clear pre-trade announcement with SABP diagnostics."""
     question = market.get("question", "Unknown")
     end_raw  = (market.get("endDate") or "")[:10]
     slug     = market.get("slug", "")
     pm_link  = f"https://polymarket.com/event/{slug}" if slug else POLYMARKET_BASE
     mode_tag = "🔄" if is_ongoing else "🆕"
 
-    # Pace line — show hourly rate, daily avg, and precise hours remaining
     if pace:
         proj       = int(pace["projected"])
         total_tw   = int(pace["total"])
         hrs_rem    = pace["hours_remaining"]
-        hrly       = pace["hourly_avg"]
-        daily      = pace["daily_avg"]
-        bias_tag   = " (+early bias)" if pace["has_bias"] else ""
-        # Choose hours or minutes for display based on urgency
+        # Rates
+        lam_post   = pace.get("lambda_posterior", pace["hourly_avg"])
+        lam_hist   = pace.get("lambda_hist", 0.0)
+        lam_obs    = pace.get("lambda_obs",  lam_post)
+        cred_z     = pace.get("credibility_z", 0.0)
+        sigma      = pace.get("sigma", 0.0)
+        mismatch   = pace.get("period_mismatch", False)
+
         if hrs_rem < 1:
             time_left = f"{int(hrs_rem * 60)}min left"
         elif hrs_rem < 24:
             time_left = f"{hrs_rem:.1f}h left"
         else:
             time_left = f"{hrs_rem/24:.1f}d left"
+
+        # Credibility label
+        if cred_z < 0.2:
+            cred_label = "history-anchored"
+        elif cred_z < 0.6:
+            cred_label = "blending"
+        else:
+            cred_label = "data-driven"
+
+        mismatch_tag = "  ⚠️ period mismatch!" if mismatch else ""
         pace_line = (
-            f"📊 Pace: <b>{total_tw}</b> tweets  ·  "
-            f"{hrly:.1f}/hr ({daily:.0f}/day)  ·  "
-            f"projected <b>{proj}{bias_tag}</b>  ·  {time_left}"
+            f"📊 <b>{total_tw}</b> tweets so far  ·  {time_left}\n"
+            f"   λ̂={lam_post:.2f}/hr  λ̅={lam_hist:.2f}/hr  Z={cred_z:.0%} {cred_label}\n"
+            f"   Projected: <b>{proj} ±{sigma:.0f}</b> tweets{mismatch_tag}"
         )
     else:
         pace_line = "📊 Pace: unavailable"
 
-    # Planned buckets line
+    # Planned buckets — with probabilities if available
     if planned:
-        bucket_list = "  ".join(
-            f"<b>{lbl}</b> ${price:.3f}" for lbl, price in planned
-        )
+        if pace and pace.get("sigma", 0) > 0:
+            mu    = pace["projected"]
+            sigma = pace["sigma"]
+            nd    = NormalDist(mu=mu, sigma=sigma)
+            def bucket_prob(lbl):
+                bounds = parse_bucket_label(lbl)
+                if not bounds:
+                    return ""
+                lo, hi = bounds
+                p = (1 - nd.cdf(lo - 0.5)) if hi == 9999 else (nd.cdf(hi + 0.5) - nd.cdf(lo - 0.5))
+                return f"({p*100:.0f}%)"
+            bucket_list = "  ".join(
+                f"<b>{lbl}</b>{bucket_prob(lbl)} ${price:.3f}"
+                for lbl, price in planned
+            )
+        else:
+            bucket_list = "  ".join(
+                f"<b>{lbl}</b> ${price:.3f}" for lbl, price in planned
+            )
         buckets_line = f"🎯 Buying: {bucket_list}"
         cost = ORDER_SIZE_USD * len(planned)
         cost_line = f"💸 Total: ${cost:.2f}"
@@ -2289,33 +2510,57 @@ async def pnl_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def pace_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show live Elon tweet pace from XTracker."""
+    """Show live Elon tweet pace with full SABP diagnostics."""
     msg  = update.message or update.callback_query.message
     pace = await fetch_elon_pace()  # generic current period for /pace command
     if not pace:
         await msg.reply_text("⚠️ XTracker unavailable — try again shortly.",
                              parse_mode="HTML", reply_markup=main_menu_keyboard())
         return
-    bias_tag = " +bias" if pace["has_bias"] else ""
+
     proj     = int(pace["projected"])
     total    = int(pace["total"])
     hrs_el   = pace["hours_elapsed"]
     hrs_rem  = pace["hours_remaining"]
-    hrly     = pace["hourly_avg"]
-    daily    = pace["daily_avg"]
+    sigma    = pace.get("sigma", 0.0)
+    lam_post = pace.get("lambda_posterior", pace["hourly_avg"])
+    lam_hist = pace.get("lambda_hist", 0.0)
+    lam_obs  = pace.get("lambda_obs",  lam_post)
+    cred_z   = pace.get("credibility_z", 0.0)
+    mismatch = pace.get("period_mismatch", False)
     period   = f"{pace['start_date'][:10]} → {pace['end_date'][:10]}"
+
     if hrs_rem < 1:
         time_left = f"{int(hrs_rem*60)}min"
     elif hrs_rem < 24:
         time_left = f"{hrs_rem:.1f}h"
     else:
         time_left = f"{hrs_rem/24:.1f}d"
+
+    # Credibility label
+    if cred_z < 0.2:
+        cred_label = "history-anchored 📜"
+    elif cred_z < 0.6:
+        cred_label = "blending 🔀"
+    else:
+        cred_label = "data-driven 📡"
+
+    mismatch_warn = "\n  ⚠️ <b>Period mismatch</b> — using historical rate only" if mismatch else ""
+
     await msg.reply_text(
         f"🐦 <b>Elon Tweet Pace</b>  ·  {pace['tier']}\n"
-        f"  So far:    <b>{total} tweets</b>  ({hrs_el:.0f}h elapsed)\n"
-        f"  Rate:      <b>{hrly:.1f}/hr</b>  ({daily:.0f}/day)\n"
-        f"  Projected: <b>{proj}{bias_tag}</b>  ({time_left} left)\n"
-        f"  Period:    {period}",
+        f"  Period:   {period}\n"
+        f"  Elapsed:  {hrs_el:.0f}h elapsed  ·  {time_left} left\n"
+        f"  Tweets:   <b>{total}</b> so far\n"
+        f"\n"
+        f"📈 <b>SABP Rates</b>\n"
+        f"  λ_obs  = <b>{lam_obs:.2f}/hr</b>  (this period, raw)\n"
+        f"  λ_hist = <b>{lam_hist:.2f}/hr</b>  (EWMA history, auto)\n"
+        f"  λ̂      = <b>{lam_post:.2f}/hr</b>  (Bayesian posterior)\n"
+        f"  Z      = <b>{cred_z:.0%}</b>  {cred_label}\n"
+        f"\n"
+        f"🎯 <b>Projection</b>: <b>{proj} ± {sigma:.0f}</b> tweets  ({time_left})"
+        f"{mismatch_warn}",
         parse_mode="HTML",
         reply_markup=main_menu_keyboard(),
     )
