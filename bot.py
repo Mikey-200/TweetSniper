@@ -1276,11 +1276,21 @@ async def send_pre_buy_alert(app: Application, market: dict, pace: Optional[dict
         else:
             cred_label = "data-driven"
 
-        mismatch_tag = "  ⚠️ period mismatch!" if mismatch else ""
+        mismatch_tag = "  ⚠️ Estimate based on history only (period mismatch)" if mismatch else ""
+        proj_lo = max(0, proj - int(sigma))
+        proj_hi = proj + int(sigma)
+
+        if cred_z < 0.2:
+            conf_label = f"Low — only {total} tweets seen so far, using history"
+        elif cred_z < 0.6:
+            conf_label = f"Medium — {cred_z:.0%} live data + {(1-cred_z):.0%} history"
+        else:
+            conf_label = f"High — {cred_z:.0%} from live data"
+
         pace_line = (
             f"📊 <b>{total_tw}</b> tweets so far  ·  {time_left}\n"
-            f"   λ̂={lam_post:.2f}/hr  λ̅={lam_hist:.2f}/hr  Z={cred_z:.0%} {cred_label}\n"
-            f"   Projected: <b>{proj} ±{sigma:.0f}</b> tweets{mismatch_tag}"
+            f"   Tweeting at <b>{lam_post:.1f}/hr</b>  ·  Confidence: {conf_label}\n"
+            f"   Projected: <b>{proj} tweets</b>  (likely range: {proj_lo}–{proj_hi}){mismatch_tag}"
         )
     else:
         pace_line = "📊 Pace: unavailable"
@@ -2510,57 +2520,155 @@ async def pnl_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def pace_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show live Elon tweet pace with full SABP diagnostics."""
-    msg  = update.message or update.callback_query.message
-    pace = await fetch_elon_pace()  # generic current period for /pace command
-    if not pace:
+    """Show Elon tweet pace in plain English — focuses on the current weekly market."""
+    msg = update.message or update.callback_query.message
+
+    # Load all XTracker tracking periods
+    trackings = await _load_xtracker_trackings()
+    if not trackings:
         await msg.reply_text("⚠️ XTracker unavailable — try again shortly.",
                              parse_mode="HTML", reply_markup=main_menu_keyboard())
         return
 
-    proj     = int(pace["projected"])
+    now_utc = datetime.now(timezone.utc)
+
+    # Classify each tracking as active-weekly, active-monthly, or completed
+    active_weekly  = []   # running markets shorter than 20 days
+    completed_list = []   # finished markets
+
+    for t in trackings:
+        try:
+            start = datetime.fromisoformat(t.get("startDate", "").replace("Z", "+00:00"))
+            end   = datetime.fromisoformat(t.get("endDate",   "").replace("Z", "+00:00"))
+            dur_hrs = max(1.0, (end - start).total_seconds() / 3600)
+            hrs_rem = (end - now_utc).total_seconds() / 3600
+            if start <= now_utc <= end and dur_hrs < 480:   # active, < 20 days
+                active_weekly.append((hrs_rem, dur_hrs, t))
+            elif end < now_utc:
+                completed_list.append((end, t))
+        except Exception:
+            continue
+
+    # Primary: soonest-ending weekly market (most urgent/relevant)
+    active_weekly.sort(key=lambda x: x[0])
+    primary_t = active_weekly[0][2] if active_weekly else None
+
+    if primary_t is None:
+        await msg.reply_text(
+            "📭 No active weekly Elon tweet market found right now.\n"
+            "The bot will pick one up when it appears.",
+            parse_mode="HTML", reply_markup=main_menu_keyboard())
+        return
+
+    # Fetch SABP pace data for that tracking
+    slug = (primary_t.get("marketLink", "") or "").rstrip("/").split("/")[-1]
+    pace = await fetch_elon_pace(market_slug=slug)
+    if not pace:
+        await msg.reply_text("⚠️ Could not fetch pace data — try again shortly.",
+                             parse_mode="HTML", reply_markup=main_menu_keyboard())
+        return
+
+    # ── Plain-English values ──────────────────────────────────────────────
     total    = int(pace["total"])
+    proj     = int(pace["projected"])
+    sigma    = pace.get("sigma", 0.0)
     hrs_el   = pace["hours_elapsed"]
     hrs_rem  = pace["hours_remaining"]
-    sigma    = pace.get("sigma", 0.0)
-    lam_post = pace.get("lambda_posterior", pace["hourly_avg"])
-    lam_hist = pace.get("lambda_hist", 0.0)
-    lam_obs  = pace.get("lambda_obs",  lam_post)
+    speed    = pace.get("lambda_posterior", pace["hourly_avg"])  # best rate estimate
+    hist_spd = pace.get("lambda_hist",  speed)
+    raw_spd  = pace.get("lambda_obs",   speed)
     cred_z   = pace.get("credibility_z", 0.0)
     mismatch = pace.get("period_mismatch", False)
-    period   = f"{pace['start_date'][:10]} → {pace['end_date'][:10]}"
+    title    = primary_t.get("title", "Current market")
+
+    proj_lo = max(0, proj - int(sigma))
+    proj_hi = proj + int(sigma)
 
     if hrs_rem < 1:
         time_left = f"{int(hrs_rem*60)}min"
     elif hrs_rem < 24:
-        time_left = f"{hrs_rem:.1f}h"
+        time_left = f"{hrs_rem:.1f} hours"
     else:
-        time_left = f"{hrs_rem/24:.1f}d"
+        time_left = f"{hrs_rem/24:.1f} days"
 
-    # Credibility label
+    # Activity level without emoji codes
+    tier_text = {
+        "🟢 Low":       "🟢 Low activity",
+        "🟡 Medium":    "🟡 Medium activity",
+        "🟠 High":      "🟠 High activity",
+        "🔴 Very High": "🔴 Very high activity",
+    }.get(pace["tier"], pace["tier"])
+
+    # Confidence explanation in plain English
     if cred_z < 0.2:
-        cred_label = "history-anchored 📜"
+        conf_line = (
+            f"  Low — only {total} tweets so far, relying mostly on history.\n"
+            f"  Historical average: <b>{hist_spd:.1f}/hr</b>"
+        )
     elif cred_z < 0.6:
-        cred_label = "blending 🔀"
+        conf_line = (
+            f"  Medium — blending live data ({cred_z:.0%}) with history ({(1-cred_z):.0%}).\n"
+            f"  Live pace: <b>{raw_spd:.1f}/hr</b>  ·  Hist. avg: <b>{hist_spd:.1f}/hr</b>"
+        )
     else:
-        cred_label = "data-driven 📡"
+        conf_line = (
+            f"  High — enough tweets seen to trust live data ({cred_z:.0%}).\n"
+            f"  Live pace: <b>{raw_spd:.1f}/hr</b>  ·  Hist. avg: <b>{hist_spd:.1f}/hr</b>"
+        )
 
-    mismatch_warn = "\n  ⚠️ <b>Period mismatch</b> — using historical rate only" if mismatch else ""
+    mismatch_warn = (
+        "\n⚠️ <b>Note:</b> Only a monthly tracker is available right now.\n"
+        "The estimate below uses historical averages, not live data."
+    ) if mismatch else ""
+
+    # ── Build main output ─────────────────────────────────────────────────
+    lines = [
+        f"🐦 <b>Elon Tweet Pace</b>  ·  {tier_text}",
+        f"📅 <b>{title}</b>",
+        f"⏱ {hrs_el:.0f}h elapsed  ·  {time_left} left",
+        mismatch_warn,
+        "",
+        f"<b>Tweets so far:</b>  {total}",
+        f"<b>Tweeting speed:</b>  <b>{speed:.1f}/hr</b>  ({speed*24:.0f}/day)",
+        f"<b>Confidence:</b>",
+        conf_line,
+        "",
+        f"🎯 <b>Predicted total:  {proj} tweets</b>",
+        f"   Likely range: {proj_lo} – {proj_hi} tweets",
+    ]
+
+    # ── Other analytics: most recently COMPLETED market ───────────────────
+    completed_list.sort(key=lambda x: x[0], reverse=True)
+    if completed_list:
+        recent_t = completed_list[0][1]
+        try:
+            async with httpx.AsyncClient(timeout=10) as http:
+                r = await http.get(
+                    f"{XTRACKER_API}/trackings/{recent_t['id']}",
+                    params={"includeStats": "true"},
+                )
+                r.raise_for_status()
+                body = r.json()
+            rdata  = body.get("data", body) if isinstance(body, dict) else body
+            rstats = rdata.get("stats", {})
+            r_total = float(rstats.get("total", 0))
+            r_start = datetime.fromisoformat(rdata.get("startDate", "").replace("Z", "+00:00"))
+            r_end   = datetime.fromisoformat(rdata.get("endDate",   "").replace("Z", "+00:00"))
+            r_dur   = max(1.0, (r_end - r_start).total_seconds() / 3600)
+            r_rate  = r_total / r_dur
+            r_title = recent_t.get("title", "Previous market")
+            r_date  = r_end.strftime("%b %d")
+            lines += [
+                "",
+                "📊 <b>Last completed market</b>",
+                f"  <i>{r_title}</i>  (ended {r_date})",
+                f"  Total tweets: <b>{int(r_total)}</b>  ·  Avg speed: <b>{r_rate:.1f}/hr</b> ({r_rate*24:.0f}/day)",
+            ]
+        except Exception as e:
+            log.debug("pace_cmd: could not fetch recent completed stats: %s", e)
 
     await msg.reply_text(
-        f"🐦 <b>Elon Tweet Pace</b>  ·  {pace['tier']}\n"
-        f"  Period:   {period}\n"
-        f"  Elapsed:  {hrs_el:.0f}h elapsed  ·  {time_left} left\n"
-        f"  Tweets:   <b>{total}</b> so far\n"
-        f"\n"
-        f"📈 <b>SABP Rates</b>\n"
-        f"  λ_obs  = <b>{lam_obs:.2f}/hr</b>  (this period, raw)\n"
-        f"  λ_hist = <b>{lam_hist:.2f}/hr</b>  (EWMA history, auto)\n"
-        f"  λ̂      = <b>{lam_post:.2f}/hr</b>  (Bayesian posterior)\n"
-        f"  Z      = <b>{cred_z:.0%}</b>  {cred_label}\n"
-        f"\n"
-        f"🎯 <b>Projection</b>: <b>{proj} ± {sigma:.0f}</b> tweets  ({time_left})"
-        f"{mismatch_warn}",
+        "\n".join(l for l in lines if l is not None),
         parse_mode="HTML",
         reply_markup=main_menu_keyboard(),
     )
