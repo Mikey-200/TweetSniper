@@ -115,6 +115,10 @@ SKIP_MARGIN_MULTIPLIER = float(os.getenv("SKIP_MARGIN_MULTIPLIER", "1.5"))
 # === Position Management ===
 MAX_MARKETS_PER_CYCLE  = int(os.getenv("MAX_MARKETS_PER_CYCLE",  "2"))   # max markets to enter per scan cycle
 MAX_OPEN_ORDERS        = int(os.getenv("MAX_OPEN_ORDERS",         "6"))   # hard cap on concurrent open positions
+MIN_MARKET_AGE_HOURS   = float(os.getenv("MIN_MARKET_AGE_HOURS",  "12"))  # 12h gate: don't enter until market is this old
+MIN_CONFIDENCE_PCT     = float(os.getenv("MIN_CONFIDENCE_PCT",    "60"))  # skip buckets below this fused-confidence %
+KELLY_FRACTION         = float(os.getenv("KELLY_FRACTION",        "0.25")) # fraction of full Kelly (0.25 = quarter-Kelly)
+MARKET_HISTORY_FILE    = os.getenv("MARKET_HISTORY_FILE", "market_history.json")
 STOP_LOSS_PCT          = float(os.getenv("STOP_LOSS_PCT",         "0.60")) # cut loss when down 60% (price at 40% of entry)
 
 # === Take-Profit Multipliers (per slot) ===
@@ -191,6 +195,19 @@ traded_token_ids: set = set()
 
 # Sequential session counter
 session_counter = 0
+
+# ── Single-market focus lock (Method 4) ──────────────────────────────────────────────
+# Bot focuses on ONE market at a time (earliest-expiring).
+# A lock is set when we first encounter a market. While locked,
+# all other markets are ignored. Lock clears when market ends.
+_locked_market_id:       str           = ""    # Gamma/Polymarket market ID
+_locked_market_end_dt:   Optional[datetime] = None   # UTC end time of locked market
+_locked_market_title:    str           = ""    # human-readable (for notifications)
+_locked_market_start_dt: Optional[datetime] = None   # to compute market age hours
+_monitored_notified_ids: set           = set()  # IDs we've sent the 12h-gate notice for
+
+# ── Method 5: dynamic prior strength (empirical Bayes) ────────────────────────
+_dynamic_beta0: float = 0.0  # 0 = use default; computed from market history when > 0
 
 # Session P&L accumulators
 pnl_summary = {
@@ -465,6 +482,198 @@ def compute_bucket_probabilities(tokens: list, mu: float, sigma: float) -> list:
     return results
 
 
+# ──────────────────────────────────────────────────────────────────────
+# SECTION 7b — HELPER ENGINES (History · Kelly · Confidence · Reasoning)
+# ──────────────────────────────────────────────────────────────────────
+
+def load_market_history() -> dict:
+    """Load market history JSON. Returns {beta0, markets:[...]}."""
+    if not os.path.exists(MARKET_HISTORY_FILE):
+        return {"beta0": 0.0, "markets": []}
+    try:
+        with open(MARKET_HISTORY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        log.warning("load_market_history error: %s", e)
+        return {"beta0": 0.0, "markets": []}
+
+
+def save_market_history(history: dict) -> None:
+    """Persist market history JSON to disk."""
+    try:
+        with open(MARKET_HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history, f, indent=2, default=str)
+    except Exception as e:
+        log.error("save_market_history error: %s", e)
+
+
+def compute_dynamic_beta0_from_history(markets: list) -> float:
+    """Method 5 — Empirical Bayes: compute optimal prior strength β₀.
+
+    β₀ = mean_rate / variance_between_periods
+
+    Intuition: if Elon's rate is very consistent across weeks (low variance),
+    we need less live data to be confident → smaller β₀. If it varies a lot,
+    we need more data before trusting live observations → larger β₀.
+
+    Requires ≥ 3 completed markets. Returns 0.0 (use default) if insufficient.
+    """
+    import statistics as _stats
+    rates = [m["rate_per_hour"] for m in markets if m.get("rate_per_hour", 0) > 0]
+    if len(rates) < 3:
+        return 0.0
+    try:
+        mean_r = _stats.mean(rates)
+        var_r  = _stats.variance(rates)
+        if var_r < 0.001:
+            return 48.0  # very stable pace → use standard prior
+        beta0 = mean_r / var_r
+        beta0 = max(8.0, min(168.0, beta0))
+        log.info("Method 5: β₀=%.1f from %d periods (mean=%.2f/hr, var=%.4f)",
+                 beta0, len(rates), mean_r, var_r)
+        return beta0
+    except Exception as e:
+        log.warning("compute_dynamic_beta0 error: %s", e)
+        return 0.0
+
+
+async def record_completed_market(tracking_id: str, title: str,
+                                  total_tweets: float, hours: float) -> None:
+    """Method 5 — Record a completed market and recompute β₀ from history."""
+    global _dynamic_beta0
+    if hours <= 0 or total_tweets <= 0:
+        return
+    rate    = total_tweets / hours
+    history = load_market_history()
+    markets = history.get("markets", [])
+    if any(m.get("tracking_id") == tracking_id for m in markets):
+        return   # already recorded
+    markets.append({
+        "tracking_id":  tracking_id,
+        "title":        title,
+        "total_tweets": round(total_tweets, 0),
+        "hours":        round(hours, 2),
+        "rate_per_hour": round(rate, 4),
+        "recorded_at":  datetime.now(timezone.utc).isoformat(),
+    })
+    markets = markets[-20:]   # keep last 20 markets
+    new_beta0 = compute_dynamic_beta0_from_history(markets)
+    history   = {"beta0": new_beta0, "markets": markets}
+    save_market_history(history)
+    if new_beta0 > 0:
+        _dynamic_beta0 = new_beta0
+        await send_message(None,
+            f"🧬 <b>Bot self-updated</b> (Method 5)\n"
+            f"  Recorded: <i>{title[:50]}</i> — {int(total_tweets)} tweets, {rate:.2f}/hr\n"
+            f"  New prior strength: β₀ = {new_beta0:.1f}h  "
+            f"  (from {len(markets)} markets)")
+    log.info("Method 5: recorded '%s': %.0f tweets / %.0fh = %.3f/hr",
+             title[:40], total_tweets, hours, rate)
+
+
+def kelly_bet_size(p_fused: float, price: float,
+                   balance: float, max_bet: float) -> float:
+    """Kelly Criterion: compute optimal bet size, floored at $1, capped at max_bet.
+
+    Returns 0.0 to skip the bet when edge is negative.
+
+    Uses quarter-Kelly (KELLY_FRACTION=0.25) — conservative setting that
+    prevents ruin even if our probability estimate is slightly off.
+
+    Formula:  edge = p × (1/price) − 1
+              f*   = edge / (1/price − 1)
+              bet  = balance × f* × KELLY_FRACTION × 4
+    """
+    if price <= 0 or price >= 1 or p_fused <= 0:
+        return max_bet  # no data → use full size
+    b    = (1.0 / price) - 1.0   # net odds per $1 staked
+    if b <= 0:
+        return 0.0
+    edge = p_fused * (1.0 + b) - 1.0   # = p_fused/price − 1
+    if edge <= 0:
+        return 0.0   # negative edge → skip → protect capital
+    f_full = edge / b
+    f_safe = f_full * KELLY_FRACTION * 4.0  # KELLY_FRACTION=0.25 → full Kelly at ×4
+    bet    = balance * f_safe
+    bet    = min(bet, max_bet)
+    if bet < 1.0:
+        return 1.0 if edge > 0.08 else 0.0  # minimum $1 only if edge is meaningful
+    return round(bet, 2)
+
+
+def confidence_score(p_fused: float, cred_z: float,
+                     market_age_hrs: float, has_mismatch: bool) -> int:
+    """Compute overall decision confidence 0–100.
+
+    base  = fused probability × 100
+    ±adj  = credibility factor (Z) adjustment
+    +bonus= market age (older = more data = more reliable)
+    −pen  = period mismatch (tracking doesn't match market)
+    """
+    base       = p_fused * 100
+    z_adj      = (cred_z - 0.5) * 20          # −10 … +10
+    age_bonus  = min(10.0, max(0.0, (market_age_hrs - 12) / 3.6))   # +0 … +10
+    mismatch_p = -15.0 if has_mismatch else 0.0
+    return max(5, min(95, int(base + z_adj + age_bonus + mismatch_p)))
+
+
+def format_entry_reason(label: str, p_fused: float, p_sabp: float, p_market: float,
+                        cred_z: float, pace: dict, bet_usd: float, conf: int) -> str:
+    """Plain-English reasoning for entering a bucket."""
+    proj    = int(pace.get("projected", 0))
+    sigma   = pace.get("sigma", 0.0)
+    total   = int(pace.get("total", 0))
+    hrs_el  = pace.get("hours_elapsed", 0)
+    proj_lo = max(0, proj - int(sigma))
+    proj_hi = proj + int(sigma)
+    edge    = p_sabp - p_market
+    edge_str = (
+        f"we see {edge*100:.0f}pt edge above market ✨" if edge > 0.12 else
+        f"slight edge vs market (+{edge*100:.0f}pt)"   if edge > 0.04 else
+        "aligned with market"                           if edge >= -0.04 else
+        f"market disagrees (caution, -{abs(edge)*100:.0f}pt)"
+    )
+    data_str = (
+        f"Low live data ({total} tweets / {hrs_el:.0f}h) — anchored to history" if cred_z < 0.2 else
+        f"Mixed: {cred_z:.0%} live + {(1-cred_z):.0%} history"                 if cred_z < 0.6 else
+        f"Strong live data ({cred_z:.0%} weight)"
+    )
+    return (
+        f"🧠 <b>Why buying {label}:</b>\n"
+        f"  Projection: {proj} tweets (range {proj_lo}–{proj_hi})\n"
+        f"  Bucket chance: <b>{p_fused*100:.0f}%</b> — {edge_str}\n"
+        f"  Data quality: {data_str}\n"
+        f"  Bet size: <b>${bet_usd:.2f}</b>  ·  <b>Confidence: {conf}/100</b>"
+    )
+
+
+def format_skip_reason(label: str, reason: str, conf: int = 0) -> str:
+    """Plain-English reasoning for skipping a bucket."""
+    conf_tag = f"  (confidence: {conf}/100)" if conf > 0 else ""
+    return f"⏭ <b>Skipping {label}:</b> {reason}{conf_tag}"
+
+
+def format_monitor_message(title: str, market_age_hrs: float,
+                           pace: Optional[dict]) -> str:
+    """Notification sent when 12h gate blocks entry."""
+    wait_hrs = max(0.0, MIN_MARKET_AGE_HOURS - market_age_hrs)
+    pace_line = ""
+    if pace:
+        proj   = int(pace.get("projected", 0))
+        total  = int(pace.get("total", 0))
+        cred_z = pace.get("credibility_z", 0.0)
+        pace_line = (
+            f"\n  Early data: {total} tweets so far ({cred_z:.0%} reliable)"
+            f"\n  Early estimate: ~{proj} tweets"
+        )
+    return (
+        f"📍 <b>Monitoring</b> — {title[:50]}\n"
+        f"  Market is only {market_age_hrs:.1f}h old — need {MIN_MARKET_AGE_HOURS:.0f}h minimum\n"
+        f"  ⏳ Will re-assess in ~{wait_hrs:.1f}h"
+        f"{pace_line}"
+    )
+
+
 async def fetch_elon_pace(market_slug: str = "") -> Optional[dict]:
     """Fetch Elon's tweet pace for a SPECIFIC market period.
 
@@ -605,7 +814,7 @@ async def fetch_elon_pace(market_slug: str = "") -> Optional[dict]:
         # Prior:     λ ~ Gamma(α₀, β₀)  where α₀ = λ_hist × β₀
         # Posterior: λ | data ~ Gamma(α₀ + n, β₀ + h_e)
         # Posterior mean: λ̂ = (α₀ + n) / (β₀ + h_e)
-        beta0  = _BAYESIAN_BETA0                  # prior strength in hours
+        beta0  = _dynamic_beta0 if _dynamic_beta0 > 0 else _BAYESIAN_BETA0  # Method 5: adaptive
         alpha0 = lambda_hist * beta0              # prior pseudo-count
 
         if period_mismatch:
@@ -659,8 +868,8 @@ async def fetch_elon_pace(market_slug: str = "") -> Optional[dict]:
             "sigma":            sigma,
             "pct_complete":     pct_complete,
             "tier":             tier,
-            "has_bias":         False,              # replaced by Bayesian prior
-            # SABP diagnostics (for Telegram /pace display)
+            "has_bias":         False,
+            # SABP diagnostics
             "lambda_hist":      lambda_hist,
             "lambda_obs":       lambda_obs,
             "lambda_posterior": lambda_posterior,
@@ -676,21 +885,20 @@ async def fetch_elon_pace(market_slug: str = "") -> Optional[dict]:
 
 
 # ──────────────────────────────────────────────────────────────────────
-
 # SECTION 8 — BUCKET STRATEGY
 # ──────────────────────────────────────────────────────────────────────
 
-def parse_bucket_label(label: str) -> tuple:
+def parse_bucket_label(label: str) -> Optional[tuple]:
     """Parse a bucket outcome label into (low_bound, high_bound) integers.
 
     Handles all formats observed on Polymarket:
-      "220-239"    → (220, 239)
-      "580+"       → (580, 9999)
-      "320+"       → (320, 9999)
-      "<20"        → (0, 19)
-      "Under 100"  → (0, 99)
-      "100-119"    → (100, 119)
-      "Other"      → None (skip)
+      "220-239"    -> (220, 239)
+      "580+"       -> (580, 9999)
+      "320+"       -> (320, 9999)
+      "<20"        -> (0, 19)
+      "Under 100"  -> (0, 99)
+      "100-119"    -> (100, 119)
+      "Other"      -> None (skip)
     """
     label = label.strip()
 
@@ -724,99 +932,96 @@ def parse_bucket_label(label: str) -> tuple:
 
 
 def select_buckets(tokens: list, pace: dict) -> list:
-    """SABP probability-based bucket selection.
+    """SABP + Method 3: fused probability bucket selection.
 
-    Uses the Bayesian posterior projection (mu, sigma) from fetch_elon_pace()
-    to compute P(bucket wins) for every token via NormalDist, then selects
-    the top BUCKETS_TO_BUY buckets by probability.
-
-    The highest-probability bucket (center) is always slot 0 so it is placed
-    first. The next two highest are slots 1 and 2.
-
-    Falls back to legacy center-based selection if pace has no sigma.
-
-    Args:
-        tokens: list of {token_id, outcome, price} dicts from Gamma API
-        pace:   dict from fetch_elon_pace() — must contain 'projected' and 'sigma'
-
-    Returns:
-        list of (token_id, label, slot_index, low_bound, high_bound)
-        ordered: highest-probability first
+    Fuses SABP Bayesian probability with market's implied probability (price),
+    weighted by credibility Z. Applies Kelly/confidence skip. Returns 7-tuples:
+        (token_id, label, slot_idx, low, high, p_fused, confidence)
     """
     projected = pace["projected"]
     sigma     = pace.get("sigma", 0.0)
+    cred_z    = pace.get("credibility_z", 0.0)
+    mismatch  = pace.get("period_mismatch", False)
+    market_age = pace.get("hours_elapsed", MIN_MARKET_AGE_HOURS)
 
-    # Parse all tokens into (low, high, token_id, label), skip lowest bucket
+    # Parse all tokens, preserving price
     parsed = []
     for t in tokens:
-        label = t.get("outcome", "")
+        label  = t.get("outcome", "")
         bounds = parse_bucket_label(label)
         if bounds is None:
             continue
         low, high = bounds
-        parsed.append((low, high, t["token_id"], label))
+        parsed.append((low, high, t["token_id"], label, t.get("price", 0.0)))
     parsed.sort(key=lambda x: x[0])
 
     if not parsed:
         return []
 
-    # Always skip bucket[0] (the very lowest — Elon never tweets that little)
-    candidates = parsed[1:]
-    if not candidates:
-        candidates = parsed  # safety: if only 1 bucket, use it
+    # Skip bucket[0] (lowest — Elon never tweets that little)
+    candidates = parsed[1:] if len(parsed) > 1 else parsed
 
-    # ── SABP: Probability-based selection ────────────────────────────────
     if sigma > 0:
-        # Rebuild candidates as token dicts so compute_bucket_probabilities works
+        # Build token dicts for SABP probability computation
         cand_tokens = [
-            {"token_id": tid, "outcome": label}
-            for (low, high, tid, label) in candidates
+            {"token_id": tid, "outcome": lbl}
+            for (lo, hi, tid, lbl, _price) in candidates
         ]
-        probs = compute_bucket_probabilities(cand_tokens, mu=projected, sigma=sigma)
-        # probs = [(prob, token_id, label, lo, hi), ...] sorted descending
+        price_map = {tid: price for (lo, hi, tid, lbl, price) in candidates}
+        sabp_probs = compute_bucket_probabilities(cand_tokens, mu=projected, sigma=sigma)
 
-        if not probs:
-            return []
+        # Fuse: p_fused = Z × p_sabp + (1-Z) × p_market
+        fused = []
+        for (p_sabp, token_id, label, lo, hi) in sabp_probs:
+            p_market = max(0.01, min(0.99, price_map.get(token_id, p_sabp)))
+            p_fused  = cred_z * p_sabp + (1.0 - cred_z) * p_market
+            conf     = confidence_score(p_fused, cred_z, market_age, mismatch)
+            if p_fused * 100 >= MIN_CONFIDENCE_PCT:
+                fused.append((p_fused, p_sabp, p_market, token_id, label, lo, hi, conf))
 
-        # Take top BUCKETS_TO_BUY by probability
-        top = probs[:BUCKETS_TO_BUY]
+        fused.sort(key=lambda x: x[0], reverse=True)
+        top = fused[:BUCKETS_TO_BUY]
 
-        # Build result: slot 0 = highest probability (placed first)
+        if not top:
+            # Confidence gate blocked all — relax and take top SABP
+            log.warning("select_buckets: all below %.0f%% confidence — relaxing gate",
+                        MIN_CONFIDENCE_PCT)
+            for (p_sabp, token_id, label, lo, hi) in sabp_probs[:BUCKETS_TO_BUY]:
+                p_market = price_map.get(token_id, p_sabp)
+                p_fused  = cred_z * p_sabp + (1.0 - cred_z) * p_market
+                conf     = confidence_score(p_fused, cred_z, market_age, mismatch)
+                top.append((p_fused, p_sabp, p_market, token_id, label, lo, hi, conf))
+
         result = []
-        for slot_idx, (prob, token_id, label, lo, hi) in enumerate(top):
-            result.append((token_id, label, slot_idx, lo, hi))
+        for slot_idx, (p_fused, p_sabp, p_market, token_id, label, lo, hi, conf) in enumerate(top):
+            result.append((token_id, label, slot_idx, lo, hi, p_fused, conf))
 
-        log.info(
-            "SABP bucket selection: μ=%.0f σ=%.1f → %s",
-            projected, sigma,
-            [(f"{lbl}({p*100:.0f}%)") for (p, tid, lbl, lo, hi) in probs[:BUCKETS_TO_BUY]],
-        )
+        log.info("SABP+M3: μ=%.0f σ=%.1f Z=%.0f%% → %s",
+                 projected, sigma, cred_z*100,
+                 [(f"{lbl}({pf*100:.0f}%)") for (pf, *_, lbl, lo, hi, c) in top])
         return result
 
-    # ── Legacy fallback (no sigma available) ─────────────────────────────
-    log.warning("select_buckets: no sigma in pace — using legacy center-based selection")
-
-    # Find CENTER bucket containing projected
+    # Legacy fallback (no sigma)
+    log.warning("select_buckets: no sigma — using center-based fallback")
     center_idx = None
-    for i, (low, high, token_id, label) in enumerate(candidates):
-        if low <= projected <= high or (high == 9999 and projected >= low):
+    cands_simple = [(lo, hi, tid, lbl) for (lo, hi, tid, lbl, _p) in candidates]
+    for i, (lo, hi, tid, lbl) in enumerate(cands_simple):
+        if lo <= projected <= hi or (hi == 9999 and projected >= lo):
             center_idx = i
             break
     if center_idx is None:
-        for i, (low, high, token_id, label) in enumerate(candidates):
-            if low > projected:
+        for i, (lo, hi, tid, lbl) in enumerate(cands_simple):
+            if lo > projected:
                 center_idx = i
                 break
     if center_idx is None:
-        center_idx = len(candidates) - 1
-
-    selected = [candidates[center_idx]]
+        center_idx = len(cands_simple) - 1
+    selected = [cands_simple[center_idx]]
     if center_idx - 1 >= 0:
-        selected.append(candidates[center_idx - 1])
+        selected.append(cands_simple[center_idx - 1])
     if center_idx - 2 >= 0:
-        selected.append(candidates[center_idx - 2])
-
-    return [(tid, lbl, si, lo, hi)
+        selected.append(cands_simple[center_idx - 2])
+    return [(tid, lbl, si, lo, hi, 0.0, 50)
             for si, (lo, hi, tid, lbl) in enumerate(selected)]
 
 
@@ -1414,21 +1619,57 @@ async def process_market(app: Application, market: dict,
     The scanner uses this return value to stop processing further markets
     once one has been successfully traded (soonest-first strategy).
     """
-    global session_counter
+    global session_counter, _locked_market_id, _locked_market_end_dt
+    global _locked_market_title, _locked_market_start_dt, _monitored_notified_ids
 
-    question = market.get("question", "Unknown")
+    question   = market.get("question", "Unknown")
     market_key = question[:30]
+    market_id  = market.get("id", market.get("conditionId", ""))
 
-    # Duplicate guard: skip if we already have a position in this market
-    if market_key in open_positions_by_market:
-        log.debug("Already traded market: %s", market_key)
-        return
+    # ── SINGLE-MARKET FOCUS LOCK (Method 4) ────────────────────────────────────
+    now_utc = datetime.now(timezone.utc)
+    if _locked_market_id and _locked_market_id != market_id:
+        # We're locked onto a different market — ignore this one entirely
+        log.debug("Locked on %s — ignoring %s", _locked_market_title[:30], question[:30])
+        return False
 
-    # Mark as seen to prevent re-dispatch before orders are placed
-    market_id = market.get("id", market.get("conditionId", ""))
-    seen_market_ids.add(market_id)
+    # Set the lock the first time we see this market
+    if not _locked_market_id:
+        _locked_market_id    = market_id
+        _locked_market_title = question
+        # Parse market start date from pace or market dict
+        start_raw = market.get("startDate") or market.get("created_at", "")
+        try:
+            _locked_market_start_dt = datetime.fromisoformat(
+                start_raw.replace("Z", "+00:00")
+            )
+        except Exception:
+            _locked_market_start_dt = now_utc
+        end_raw = market.get("endDate") or ""
+        try:
+            _locked_market_end_dt = datetime.fromisoformat(end_raw.replace("Z", "+00:00"))
+        except Exception:
+            _locked_market_end_dt = None
+        log.info("Locked onto market: %s", question[:60])
 
-    log.info("Processing market: %s (ongoing=%s)", question[:60], is_ongoing)
+    # ── 12-HOUR ENTRY GATE (Method 4) ───────────────────────────────────────
+    # Don't enter until the market has been running for MIN_MARKET_AGE_HOURS.
+    # This ensures we have real data before committing capital.
+    if _locked_market_start_dt:
+        market_age_hrs = (now_utc - _locked_market_start_dt).total_seconds() / 3600
+    else:
+        market_age_hrs = MIN_MARKET_AGE_HOURS  # assume old enough if unknown
+
+    if market_age_hrs < MIN_MARKET_AGE_HOURS:
+        # Gate blocked — notify once then wait
+        if market_id not in _monitored_notified_ids:
+            _monitored_notified_ids.add(market_id)
+            # Fetch early pace for context
+            early_pace = await fetch_elon_pace(market_slug=market.get("slug", ""))
+            await send_message(app, format_monitor_message(
+                question, market_age_hrs, early_pace))
+        return False  # not ready to trade yet
+    # ──────────────────────────────────────────────────────────────────────
 
     # ─── EXTRACT OUTCOME TOKENS FROM GAMMA API RESPONSE ─────────────────
     # VERIFIED from live CLI output:
@@ -1520,7 +1761,7 @@ async def process_market(app: Application, market: dict,
     else:
         log.warning("No pace data — picking first %d tokens by price", BUCKETS_TO_BUY)
         selected_tokens = [
-            (t["token_id"], t.get("outcome", ""), i, 0, 9999)
+            (t["token_id"], t.get("outcome", ""), i, 0, 9999, 0.0, 50)
             for i, t in enumerate(tokens[:BUCKETS_TO_BUY])
         ]
 
@@ -1529,16 +1770,14 @@ async def process_market(app: Application, market: dict,
     # it gives <2× return even if it resolves YES. Skip to the next bucket up.
     filtered_tokens = []
     for tok in selected_tokens:
-        token_id, label, slot_idx, low, high = tok
-        # Quick price check via token's outcomePrices entry
+        token_id, label, slot_idx, low, high, p_fused, conf = tok[:5] + (tok[5] if len(tok) > 5 else 0.0,) + (tok[6] if len(tok) > 6 else 50,)
         token_price = next(
             (float(t["price"]) for t in tokens if t["token_id"] == token_id), 0.0
         )
         if token_price > 0.50 and slot_idx == 0:  # slot 0 = CENTER bucket
-            log.info("CENTER bucket '%s' skipped (price=%.3f > 0.50)", label, token_price)
-            await send_message(app,
-                f"⏭️ CENTER bucket <b>{label}</b> skipped "
-                f"(price ${token_price:.3f} > $0.50 — already priced in)")
+            reason = f"price ${token_price:.3f} > $0.50 — return < 2x, not worth the risk"
+            await send_message(app, format_skip_reason(label, reason, conf))
+            log.info("CENTER bucket '%s' skipped: %s", label, reason)
             continue
         filtered_tokens.append(tok)
     selected_tokens = filtered_tokens
@@ -1551,7 +1790,8 @@ async def process_market(app: Application, market: dict,
 
     # Pre-trade announcement: tell the user WHAT we're about to buy
     planned = []
-    for token_id, label, slot_idx, low, high in selected_tokens:
+    for tok in selected_tokens:
+        token_id, label = tok[0], tok[1]
         token_price = next(
             (float(t["price"]) for t in tokens if t["token_id"] == token_id), 0.0
         )
@@ -1580,7 +1820,11 @@ async def process_market(app: Application, market: dict,
 
     # Steps 4-7: Per-bucket execution
     placed_any = False
-    for token_id, label, slot_idx, low, high in selected_tokens:
+    for tok in selected_tokens:
+        token_id, label, slot_idx = tok[0], tok[1], tok[2]
+        low, high = tok[3], tok[4]
+        p_fused    = tok[5] if len(tok) > 5 else 0.0
+        bucket_conf = tok[6] if len(tok) > 6 else 50
         tp_mult = TP_SLOTS[slot_idx] if slot_idx < len(TP_SLOTS) else 2.0
 
         # Hard cap: never hold more than MAX_OPEN_ORDERS simultaneously
@@ -1645,9 +1889,30 @@ async def process_market(app: Application, market: dict,
             # Simulate market order: place limit at ask + 0.01 (taker)
             exec_price = min(best_ask + 0.01, price_cap)
 
-        # size is in SHARES, not USD
-        # Round UP to 4dp so (size * price) always meets the $1 CLOB minimum
-        raw_shares = ORDER_SIZE_USD / best_ask
+        # ── Kelly Criterion sizing ──────────────────────────────────────────────
+        # bet_usd: Kelly-optimal per-bucket bet, floored at $1, capped at ORDER_SIZE_USD
+        kelly_usd = kelly_bet_size(p_fused, best_ask, current_balance, ORDER_SIZE_USD)
+        if kelly_usd == 0.0:
+            reason = (
+                f"negative expected value at ${best_ask:.3f} "
+                f"with {p_fused*100:.0f}% estimated chance — protecting capital"
+            )
+            await send_message(app, format_skip_reason(label, reason, bucket_conf))
+            log.info("Kelly skip: %s (p_fused=%.2f, price=%.3f)", label, p_fused, best_ask)
+            continue
+        bet_usd = kelly_usd
+
+        # ── Entry reasoning before placing ──────────────────────────────────────
+        if pace:
+            p_sabp   = pace.get("sabp_prob_"+label, p_fused)  # best-effort
+            p_market = best_ask  # market's implied probability
+            await send_message(app, format_entry_reason(
+                label, p_fused, p_fused, p_market,
+                pace.get("credibility_z", 0.0), pace, bet_usd, bucket_conf
+            ))
+
+        # size in SHARES, not USD
+        raw_shares  = bet_usd / best_ask
         size_shares = math.ceil(raw_shares * 10_000) / 10_000
         tp_target   = best_ask * tp_mult
 
@@ -1821,12 +2086,15 @@ async def execute_tp(order_id: str, app: Application,
                 break
         rewrite_csv(rows)
 
-        emoji = "🚀" if profit_usd > 0 else "💥"
+        emoji    = "🚀" if profit_usd > 0 else "💥"
         dry_note = " [DRY RUN]" if DRY_RUN else ""
+        mult_achieved = sell_price / buy_price if buy_price > 0 else 1.0
         await send_message(app,
-            f"{emoji} <b>TP HIT{dry_note} — #{snum}  {pos['bucket']}</b>\n"
-            f"   ${buy_price:.3f} → ${sell_price:.3f}  ·  "
-            f"<b>${profit_usd:+.2f} ({profit_pct:+.1f}%)</b>")
+            f"{emoji} <b>Profit taken{dry_note} — #{snum}  {pos['bucket']}</b>\n"
+            f"  Why: price reached {mult_achieved:.1f}× entry (our target was {pos['tp_mult']:.1f}×)\n"
+            f"  ${buy_price:.3f} → ${sell_price:.3f}  ·  "
+            f"<b>${profit_usd:+.2f} ({profit_pct:+.1f}%)</b>\n"
+            f"  👍 Confidence this was right: 90/100")
         log.info("TP executed for order #%d | P&L: $%.4f (%.1f%%)",
                  snum, profit_usd, profit_pct)
     except Exception as e:
@@ -1896,11 +2164,15 @@ async def execute_stop_loss(order_id: str, app: Application,
         rewrite_csv(rows)
 
         dry_note = " [DRY RUN]" if DRY_RUN else ""
+        loss_from_entry_pct = abs(loss_pct)
         await send_message(app,
-            f"🛑 <b>STOP-LOSS{dry_note} — #{snum}  {pos['bucket']}</b>\n"
-            f"   Entry ${buy_price:.3f} → Exit ${sell_price:.3f}  ·  "
+            f"🛑 <b>Stop-loss triggered{dry_note} — #{snum}  {pos['bucket']}</b>\n"
+            f"  Why: price fell {loss_from_entry_pct:.0f}% from entry "
+            f"(threshold is {int(STOP_LOSS_PCT*100)}% drop)\n"
+            f"  Market likely moved against this bucket — cutting loss now\n"
+            f"  ${buy_price:.3f} → ${sell_price:.3f}  ·  "
             f"<b>${loss_usd:+.2f} ({loss_pct:+.1f}%)</b>\n"
-            f"   Position closed to protect remaining capital.")
+            f"  🛡 Confidence this was right: 80/100")
         log.warning("Stop-loss executed for order #%d | loss: $%.4f (%.1f%%)",
                     snum, loss_usd, loss_pct)
     except Exception as e:
