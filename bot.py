@@ -104,16 +104,17 @@ TWEET_COUNT_KEYWORDS   = {"tweet", "post", "times"}          # AND at least one 
 # === Order Parameters ===
 ORDER_SIZE_USD         = float(os.getenv("ORDER_SIZE_USD", "1.0"))
 MIN_BUY_PRICE          = float(os.getenv("MIN_BUY_PRICE", "0.10"))   # skip buckets below 10¢
-MAX_BUY_PRICE          = float(os.getenv("MAX_BUY_PRICE", "0.30"))
-MAX_BUY_PRICE_ONGOING  = float(os.getenv("MAX_BUY_PRICE_ONGOING", "0.20"))
+MAX_BUY_PRICE          = float(os.getenv("MAX_BUY_PRICE", "0.25"))        # single price cap — applies to all markets (we always enter 12h+)
+# MAX_BUY_PRICE_ONGOING removed: with the 12h gate we always enter an ongoing market;
+# MAX_BUY_PRICE now serves as the single unified cap. Delete MAX_BUY_PRICE_ONGOING from Railway.
 MAX_SPREAD             = float(os.getenv("MAX_SPREAD", "0.25"))
 EMPTY_BOOK_RETRIES     = int(os.getenv("EMPTY_BOOK_RETRIES", "6"))
 FALLBACK_GTC_PRICE     = float(os.getenv("FALLBACK_GTC_PRICE", "0.25"))
-BUCKETS_TO_BUY         = int(os.getenv("BUCKETS_TO_BUY", "3"))
-SKIP_MARGIN_MULTIPLIER = float(os.getenv("SKIP_MARGIN_MULTIPLIER", "1.5"))
+BUCKETS_TO_BUY         = int(os.getenv("BUCKETS_TO_BUY", "2"))           # 2 buckets per market (safe for $5 account)
+SKIP_MARGIN_MULTIPLIER = 1.5  # DEPRECATED — kept for compat, not used (Kelly handles skip decisions)
 
 # === Position Management ===
-MAX_MARKETS_PER_CYCLE  = int(os.getenv("MAX_MARKETS_PER_CYCLE",  "2"))   # max markets to enter per scan cycle
+MAX_MARKETS_PER_CYCLE  = int(os.getenv("MAX_MARKETS_PER_CYCLE", "1"))    # 1 = single-market lock (Method 4); raise to 2 only if lock is disabled
 MAX_OPEN_ORDERS        = int(os.getenv("MAX_OPEN_ORDERS",         "6"))   # hard cap on concurrent open positions
 MIN_MARKET_AGE_HOURS   = float(os.getenv("MIN_MARKET_AGE_HOURS",  "12"))  # 12h gate: don't enter until market is this old
 MIN_CONFIDENCE_PCT     = float(os.getenv("MIN_CONFIDENCE_PCT",    "60"))  # skip buckets below this fused-confidence %
@@ -1761,7 +1762,9 @@ async def process_market(app: Application, market: dict,
     pace = await fetch_elon_pace(market_slug=market_slug)
 
     # Step 3: Balance gate & bucket selection
-    price_cap = MAX_BUY_PRICE_ONGOING if is_ongoing else MAX_BUY_PRICE
+    # Price cap: always MAX_BUY_PRICE — with the 12h gate we are always in an
+    # "ongoing" state, so there is no longer a separate ongoing cap needed.
+    price_cap = MAX_BUY_PRICE
 
     if pace:
         selected_tokens = select_buckets(tokens, pace)
