@@ -1,0 +1,16 @@
+# Fly.io configuration for TweetSniper
+# Background worker bot — no HTTP server, just runs python bot.py continuously
+
+app = "tweetsniper"
+primary_region = "lhr"   # London, UK — avoids Polymarket US geoblock
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PYTHONUNBUFFERED = "1"
+
+[[vm]]
+  memory = "256mb"
+  cpu_kind = "shared"
+  cpus = 1
