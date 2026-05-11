@@ -1,6 +1,7 @@
-# fly.toml — TweetSniper worker bot
-# No HTTP service — this is a pure background worker process
-# Fly.io will keep it running continuously without traffic-based auto-stop
+# fly.toml app configuration file generated for tweetsniper on 2026-05-11T22:38:42Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
 
 app = 'tweetsniper'
 primary_region = 'lhr'
@@ -15,3 +16,4 @@ primary_region = 'lhr'
   memory = '256mb'
   cpu_kind = 'shared'
   cpus = 1
+  memory_mb = 256
