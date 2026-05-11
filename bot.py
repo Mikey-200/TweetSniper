@@ -275,17 +275,42 @@ async def run_clob(fn, *args, **kwargs):
 # ──────────────────────────────────────────────────────────────────────
 
 async def get_proxy_balance() -> float:
-    """Get USDC trading balance — reads on-chain from Alchemy.
+    """Get USDC trading balance.
 
-    The CLOB API's get_balance_allowance() returns 'Invalid asset type' for
-    email/magic-link proxy accounts. The on-chain balance at the proxy wallet
-    is the real source of truth and works reliably via Alchemy RPC.
+    Strategy (in order):
+    1. CLOB API get_balance_allowance(COLLATERAL) — sees funds INSIDE Polymarket's
+       CTF Exchange contract. For email/Magic.link accounts, deposits are swept
+       into the exchange, so this is the correct "available for trading" figure.
+    2. On-chain ERC-20 balanceOf() via Alchemy — fallback for MetaMask/EOA accounts
+       where USDC sits raw at the proxy wallet address.
     """
+    # ── 1. Try CLOB API balance (Polymarket internal / exchange balance) ──
+    if clob:
+        try:
+            result = await run_clob(
+                clob.get_balance_allowance,
+                params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL),
+            )
+            # result is a dict like {"balance": "110000", "allowance": "..."}
+            # balance is in raw USDC units (6 decimals)
+            if isinstance(result, dict):
+                raw_str = result.get("balance", "0") or "0"
+                raw = float(raw_str)
+                usdc = raw / (10 ** USDC_DECIMALS)
+                if usdc > 0:
+                    log.info("CLOB API balance: $%.4f USDC", usdc)
+                    return usdc
+        except Exception as e:
+            log.debug("CLOB get_balance_allowance failed (%s) — trying on-chain", e)
+
+    # ── 2. Fallback: on-chain ERC-20 balance at proxy wallet + EOA ──
     return await get_eoa_usdc_balance()
 
 
 async def get_eoa_usdc_balance() -> float:
-    """Get USDC balance (USDC.e + native) at both signing key AND proxy wallet addresses."""
+    """Get USDC balance (USDC.e + native) at both signing key AND proxy wallet addresses.
+    Used as fallback when CLOB API balance is unavailable or zero.
+    """
     if not ALCHEMY_RPC_URL or not PRIVATE_KEY:
         return 0.0
     try:
@@ -299,10 +324,10 @@ async def get_eoa_usdc_balance() -> float:
         total = 0.0
         for addr in addresses_to_check:
             for token_addr in (USDC_ADDRESS, USDC_NATIVE_ADDRESS):
-                usdc = w3.eth.contract(
+                usdc_contract = w3.eth.contract(
                     address=Web3.to_checksum_address(token_addr), abi=ERC20_ABI
                 )
-                raw = usdc.functions.balanceOf(addr).call()
+                raw = usdc_contract.functions.balanceOf(addr).call()
                 total += raw / (10 ** USDC_DECIMALS)
         return total
     except Exception as e:
