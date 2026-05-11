@@ -1,7 +1,6 @@
-# fly.toml app configuration file generated for tweetsniper on 2026-05-11T20:11:15Z
-#
-# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
-#
+# fly.toml — TweetSniper worker bot configuration
+# Generated config has been replaced with worker-optimised settings
+# See https://fly.io/docs/reference/configuration/
 
 app = 'tweetsniper'
 primary_region = 'lhr'
@@ -12,16 +11,17 @@ primary_region = 'lhr'
 [env]
   PYTHONUNBUFFERED = '1'
 
+# Worker process — no HTTP server
+# auto_stop disabled so the machine runs 24/7
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = 'stop'
+  auto_stop_machines = false
   auto_start_machines = true
-  min_machines_running = 0
+  min_machines_running = 1
   processes = ['app']
 
 [[vm]]
   memory = '256mb'
   cpu_kind = 'shared'
   cpus = 1
-  memory_mb = 256
