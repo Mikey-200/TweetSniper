@@ -1,0 +1,16 @@
+version: "3.9"
+
+services:
+  tweetsniper:
+    image: YOUR_DOCKERHUB_USERNAME/tweetsniper:latest   # replace with your Docker Hub username
+    container_name: tweetsniper
+    restart: unless-stopped          # auto-restarts on crash or VM reboot
+    env_file:
+      - .env                          # all your Railway variables go here
+    volumes:
+      - ./data:/app/data              # persists trades.csv + market_history.json
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"               # keep logs, don't fill up the 50GB disk
+        max-file: "3"

@@ -43,7 +43,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY bot.py .
 COPY .env.example .
 
-# Railway injects env vars — no .env file needed in container
+# Env vars injected at runtime via --env-file .env (docker-compose) or Railway
 ENV PYTHONUNBUFFERED=1
 
 CMD ["python", "-u", "bot.py"]
