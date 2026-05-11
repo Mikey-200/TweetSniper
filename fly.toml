@@ -1,16 +1,27 @@
-# Fly.io configuration for TweetSniper
-# Background worker bot — no HTTP server, just runs python bot.py continuously
+# fly.toml app configuration file generated for tweetsniper on 2026-05-11T13:16:35Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
 
-app = "tweetsniper"
-primary_region = "lhr"   # London, UK — avoids Polymarket US geoblock
+app = 'tweetsniper'
+primary_region = 'lhr'
 
 [build]
-  dockerfile = "Dockerfile"
+  dockerfile = 'Dockerfile'
 
 [env]
-  PYTHONUNBUFFERED = "1"
+  PYTHONUNBUFFERED = '1'
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ['app']
 
 [[vm]]
-  memory = "256mb"
-  cpu_kind = "shared"
+  memory = '256mb'
+  cpu_kind = 'shared'
   cpus = 1
+  memory_mb = 256
