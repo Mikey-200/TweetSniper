@@ -1,6 +1,6 @@
-# fly.toml — TweetSniper worker bot configuration
-# Generated config has been replaced with worker-optimised settings
-# See https://fly.io/docs/reference/configuration/
+# fly.toml — TweetSniper worker bot
+# No HTTP service — this is a pure background worker process
+# Fly.io will keep it running continuously without traffic-based auto-stop
 
 app = 'tweetsniper'
 primary_region = 'lhr'
@@ -10,16 +10,6 @@ primary_region = 'lhr'
 
 [env]
   PYTHONUNBUFFERED = '1'
-
-# Worker process — no HTTP server
-# auto_stop disabled so the machine runs 24/7
-[http_service]
-  internal_port = 8080
-  force_https = true
-  auto_stop_machines = false
-  auto_start_machines = true
-  min_machines_running = 1
-  processes = ['app']
 
 [[vm]]
   memory = '256mb'
