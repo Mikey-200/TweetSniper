@@ -10,7 +10,16 @@ primary_region = "lhr"   # London, UK — avoids Polymarket US geoblock
 [env]
   PYTHONUNBUFFERED = "1"
 
+# Restart the process automatically if it crashes
+[deploy]
+  strategy = "immediate"
+
 [[vm]]
   memory = "256mb"
   cpu_kind = "shared"
   cpus = 1
+
+# Keep exactly 1 machine running at all times
+# (Fly.io stops machines with no HTTP traffic by default — this prevents that)
+[processes]
+  app = "python -u bot.py"
