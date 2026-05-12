@@ -119,7 +119,7 @@ MAX_OPEN_ORDERS        = int(os.getenv("MAX_OPEN_ORDERS",         "6"))   # hard
 MIN_MARKET_AGE_HOURS   = float(os.getenv("MIN_MARKET_AGE_HOURS",  "12"))  # 12h gate: don't enter until market is this old
 MIN_CONFIDENCE_PCT     = float(os.getenv("MIN_CONFIDENCE_PCT",    "60"))  # skip buckets below this fused-confidence %
 KELLY_FRACTION         = float(os.getenv("KELLY_FRACTION",        "0.25")) # fraction of full Kelly (0.25 = quarter-Kelly)
-MARKET_HISTORY_FILE    = os.getenv("MARKET_HISTORY_FILE", "market_history.json")
+MARKET_HISTORY_FILE    = os.getenv("MARKET_HISTORY_FILE", "/app/data/market_history.json")
 STOP_LOSS_PCT          = float(os.getenv("STOP_LOSS_PCT",         "0.60")) # cut loss when down 60% (price at 40% of entry)
 
 # === Take-Profit Multipliers (per slot) ===
@@ -164,8 +164,14 @@ ERC20_ABI = [
     },
 ]
 
+# === Persistent Storage ===
+# On Fly.io, /app/data is a mounted volume — survives redeploys.
+# Locally (no volume), falls back to current directory.
+_DATA_DIR = "/app/data" if os.path.isdir("/app/data") else "."
+os.makedirs(_DATA_DIR, exist_ok=True)
+
 # === Trade CSV ===
-CSV_FILE = "trades.csv"
+CSV_FILE = os.path.join(_DATA_DIR, "trades.csv")
 CSV_COLUMNS = [
     "session_num", "timestamp_utc", "market_question", "bucket", "slot",
     "buy_price", "size_shares", "cost_usd", "tp_target", "tp_mult",
