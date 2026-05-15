@@ -1845,8 +1845,87 @@ async def process_market(app: Application, market: dict,
         return False
 
     if DRY_RUN:
-        await send_message(app, "🔂 [DRY RUN] — orders skipped.")
-        return False
+        # ── PAPER TRADING SIMULATION ─────────────────────────────────────────
+        # Simulates real trades without touching real funds.
+        # Records fake positions to trades.csv (buy_status = "SIM") so you can
+        # track how the strategy would have performed.
+        # The simulated exit happens when ws_price_monitor sees the price move
+        # (it reads open_positions regardless of DRY_RUN flag).
+        sim_balance = float(os.getenv("SIM_BALANCE_USD", "10.0"))  # virtual wallet
+        sim_msgs = [f"🎮 <b>SIMULATION MODE</b> — virtual ${sim_balance:.2f} wallet\n"]
+        placed_sim = False
+        for tok in selected_tokens:
+            token_id, label = tok[0], tok[1]
+            slot_idx = tok[2]
+            p_fused   = tok[5] if len(tok) > 5 else 0.0
+            bucket_conf = tok[6] if len(tok) > 6 else 50
+            tp_mult   = TP_SLOTS[slot_idx] if slot_idx < len(TP_SLOTS) else 2.0
+            token_price = next(
+                (float(t["price"]) for t in tokens if t["token_id"] == token_id), 0.0
+            )
+            if token_price <= 0:
+                continue
+            sim_bet = kelly_bet_size(p_fused, token_price, sim_balance, ORDER_SIZE_USD)
+            if sim_bet <= 0:
+                sim_msgs.append(f"  ⏭ <b>{label}</b> — negative edge, skip")
+                continue
+            sim_shares = round(sim_bet / token_price, 2)
+            tp_target  = round(token_price * tp_mult, 4)
+            sl_price   = round(token_price * (1 - STOP_LOSS_PCT), 4)
+            global session_counter
+            session_counter += 1
+            sim_session = session_counter
+            # Record to trades.csv exactly like a real trade (status = "SIM")
+            write_trade_csv({
+                "session_num":    sim_session,
+                "timestamp_utc":  datetime.now(timezone.utc).isoformat(),
+                "market_question": question,
+                "bucket":          label,
+                "slot":            slot_idx,
+                "buy_price":       token_price,
+                "size_shares":     sim_shares,
+                "cost_usd":        sim_bet,
+                "tp_target":       tp_target,
+                "tp_mult":         tp_mult,
+                "buy_order_id":    f"SIM-{sim_session}",
+                "buy_status":      "SIM",
+                "sell_price":      "",
+                "sell_order_id":   "",
+                "profit_usd":      "",
+                "profit_pct":      "",
+                "spread_at_entry": 0.0,
+                "is_fallback_gtc": False,
+                "token_id":        token_id,
+                "market_key":      market_key,
+            })
+            # Register in open_positions so the TP/SL monitor tracks it
+            open_positions[f"SIM-{sim_session}"] = {
+                "order_id":    f"SIM-{sim_session}",
+                "token_id":    token_id,
+                "label":       label,
+                "entry_price": token_price,
+                "tp_target":   tp_target,
+                "sl_price":    sl_price,
+                "size_shares": sim_shares,
+                "cost_usd":    sim_bet,
+                "session_num": sim_session,
+                "market_key":  market_key,
+                "is_sim":      True,
+            }
+            open_positions_by_market[market_key] = f"SIM-{sim_session}"
+            traded_token_ids.add(token_id)
+            pnl_summary["trades_placed"] += 1
+            sim_msgs.append(
+                f"  📝 <b>{label}</b>  @${token_price:.3f}  "
+                f"→ {sim_shares} shares  (${sim_bet:.2f} virtual)\n"
+                f"     TP: ${tp_target:.3f}  ·  SL: ${sl_price:.3f}  ·  "
+                f"Conf: {bucket_conf}%"
+            )
+            placed_sim = True
+        sim_msgs.append("\n<i>No real funds used. Monitoring for simulated TP/SL...</i>")
+        await send_message(app, "\n".join(sim_msgs))
+        return placed_sim
+        # ─────────────────────────────────────────────────────────────────────
 
     num_to_buy = len(selected_tokens)
     required = ORDER_SIZE_USD * num_to_buy
