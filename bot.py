@@ -2007,6 +2007,14 @@ async def process_market(app: Application, market: dict,
             (float(t["price"]) for t in tokens if t["token_id"] == token_id), 0.0
         )
         # Only skip if overpriced AND low confidence — high confidence justifies the premium
+        # Hard cap: never pay more than $0.70, even at very high confidence.
+        # Above $0.70 the max possible return is only 43% — too thin given market risk.
+        if token_price > 0.70 and slot_idx == 0:
+            reason = f"price ${token_price:.3f} > $0.70 hard cap — max upside too thin"
+            await send_message(app, format_skip_reason(label, reason, conf))
+            log.info("CENTER bucket '%s' skipped (hard cap): %s", label, reason)
+            continue
+        # Also skip if overpriced (>$0.50) AND low confidence (<80%)
         if token_price > 0.50 and slot_idx == 0 and p_fused < 0.80:
             reason = (
                 f"price ${token_price:.3f} > $0.50 and confidence only {conf}% "
@@ -2041,14 +2049,17 @@ async def process_market(app: Application, market: dict,
             (float(t["price"]) for t in tokens if t["token_id"] == token_id), 0.0
         )
         planned.append((label, token_price))
-    await send_pre_buy_alert(app, market, pace, tokens, planned, is_ongoing)
-
-    if clob is None:
-        await send_message(app,
-            "⚠️ CLOB not configured — set POLYGON_PRIVATE_KEY + PROXY_WALLET_ADDRESS")
-        return False
+    # Rate-limit the pre-buy alert — don't spam it every 60s if the SIM/trade fails.
+    # Uses same 15-min window as monitoring messages.
+    _prebuy_key = f"prebuy_{market_id}"
+    _PREBUY_INTERVAL = 15 * 60
+    _now_ts = time.time()
+    if _now_ts - _monitored_notified_ids.get(_prebuy_key, 0) >= _PREBUY_INTERVAL:
+        _monitored_notified_ids[_prebuy_key] = _now_ts
+        await send_pre_buy_alert(app, market, pace, tokens, planned, is_ongoing)
 
     if DRY_RUN:
+        # DRY_RUN does NOT need the CLOB client — simulation only
         # ── PAPER TRADING SIMULATION ─────────────────────────────────────────
         # Simulates real trades without touching real funds.
         # Records fake positions to trades.csv (buy_status = "SIM") so you can
@@ -2080,7 +2091,7 @@ async def process_market(app: Application, market: dict,
             session_counter += 1
             sim_session = session_counter
             # Record to trades.csv exactly like a real trade (status = "SIM")
-            write_trade_csv({
+            append_csv_row({
                 "session_num":    sim_session,
                 "timestamp_utc":  datetime.now(timezone.utc).isoformat(),
                 "market_question": question,
@@ -2130,6 +2141,12 @@ async def process_market(app: Application, market: dict,
         await send_message(app, "\n".join(sim_msgs))
         return placed_sim
         # ─────────────────────────────────────────────────────────────────────
+
+    # ── Real trading: CLOB required ──────────────────────────────────────────
+    if clob is None:
+        await send_message(app,
+            "⚠️ CLOB not configured — set POLYGON_PRIVATE_KEY + PROXY_WALLET_ADDRESS")
+        return False
 
     num_to_buy = len(selected_tokens)
     required = ORDER_SIZE_USD * num_to_buy
@@ -3015,7 +3032,10 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton("🔄 Force Scan", callback_data="menu_scan"),
+            InlineKeyboardButton("📋 History",    callback_data="menu_history"),
             InlineKeyboardButton("💳 Deposit",    callback_data="menu_deposit"),
+        ],
+        [
             InlineKeyboardButton("🏧 Withdraw",   callback_data="menu_withdraw"),
         ],
     ])
@@ -3103,6 +3123,55 @@ async def balance_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode="HTML",
         reply_markup=main_menu_keyboard(),
     )
+
+
+async def history_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show last 10 trades from trades.csv."""
+    msg = update.message or update.callback_query.message
+    rows = load_csv_rows()
+    if not rows:
+        await msg.reply_text(
+            "📭 <b>No trade history yet.</b>\n"
+            "Trades will appear here once the bot places its first order (SIM or live).",
+            parse_mode="HTML",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    # Show last 10, newest first
+    recent = list(reversed(rows[-10:]))
+    sim_note = "  <i>(SIM = paper trade)</i>" if any(r.get("buy_status") == "SIM" for r in recent) else ""
+    lines = [f"📋 <b>Trade History</b> — last {len(recent)} of {len(rows)}{sim_note}\n"]
+    for r in recent:
+        status = r.get("buy_status", "?")
+        snum   = r.get("session_num", "?")
+        bucket = r.get("bucket", "?")
+        market = r.get("market_question", "?")[:35]
+        price  = r.get("buy_price", "?")
+        cost   = r.get("cost_usd", "?")
+        profit = r.get("profit_usd", "")
+        pct    = r.get("profit_pct", "")
+        ts_raw = r.get("timestamp_utc", "")
+        try:
+            ts = datetime.fromisoformat(ts_raw).strftime("%b %d %H:%M")
+        except Exception:
+            ts = ts_raw[:16]
+
+        status_emoji = (
+            "🎮" if status == "SIM"
+            else "✅" if status == "TP"
+            else "🛑" if status == "STOP_LOSS"
+            else "⏳" if status == "OPEN"
+            else "❓"
+        )
+        profit_str = f"  <b>${float(profit):+.2f} ({float(pct):+.1f}%)</b>" if profit and pct else ""
+        lines.append(
+            f"{status_emoji} <b>#{snum}</b>  {bucket}  @${price}\n"
+            f"   {market}\n"
+            f"   Cost: ${cost}  ·  {ts}{profit_str}\n"
+        )
+    await msg.reply_text("\n".join(lines), parse_mode="HTML",
+                         reply_markup=main_menu_keyboard())
 
 
 async def pnl_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3468,6 +3537,8 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         )
     elif data == "menu_withdraw":
         await withdraw_cmd(update, ctx)
+    elif data == "menu_history":
+        await history_cmd(update, ctx)
 
     # Per-order actions
     elif data.startswith("cancel_order_"):
@@ -3807,6 +3878,7 @@ def main() -> None:
     app.add_handler(CommandHandler("withdraw", withdraw_cmd))
     app.add_handler(CommandHandler("markets",  markets_cmd))
     app.add_handler(CommandHandler("scan",     scan_cmd))
+    app.add_handler(CommandHandler("history",  history_cmd))
 
     # Inline button handler
     app.add_handler(CallbackQueryHandler(button_handler))
