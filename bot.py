@@ -117,6 +117,7 @@ SKIP_MARGIN_MULTIPLIER = 1.5  # DEPRECATED — kept for compat, not used (Kelly 
 MAX_MARKETS_PER_CYCLE  = int(os.getenv("MAX_MARKETS_PER_CYCLE", "1"))    # 1 = single-market lock (Method 4); raise to 2 only if lock is disabled
 MAX_OPEN_ORDERS        = int(os.getenv("MAX_OPEN_ORDERS",         "6"))   # hard cap on concurrent open positions
 MIN_MARKET_AGE_HOURS   = float(os.getenv("MIN_MARKET_AGE_HOURS",  "12"))  # 12h gate: don't enter until market is this old
+MIN_HOURS_REMAINING    = float(os.getenv("MIN_HOURS_REMAINING",   "24"))  # exit gate: don't enter if <24h remain before market ends
 MIN_CONFIDENCE_PCT     = float(os.getenv("MIN_CONFIDENCE_PCT",    "60"))  # skip buckets below this fused-confidence %
 KELLY_FRACTION         = float(os.getenv("KELLY_FRACTION",        "0.25")) # fraction of full Kelly (0.25 = quarter-Kelly)
 MARKET_HISTORY_FILE    = os.getenv("MARKET_HISTORY_FILE", "/app/data/market_history.json")
@@ -1454,6 +1455,22 @@ async def fetch_elon_markets(
                 if active_only and market.get("acceptingOrders") is False:
                     continue
 
+                # FILTER 5: endDate must be in the future — Gamma API sometimes
+                # returns markets with a past endDate before marking closed=True.
+                # This is the root cause of the bot locking onto expired markets.
+                end_raw_filter = market.get("endDate", "")
+                if end_raw_filter:
+                    try:
+                        end_dt_filter = datetime.fromisoformat(
+                            end_raw_filter.replace("Z", "+00:00")
+                        )
+                        if end_dt_filter <= datetime.now(timezone.utc):
+                            log.debug("Skipping expired market (endDate in past): %s",
+                                      market.get("question", "")[:60])
+                            continue
+                    except Exception:
+                        pass  # can't parse endDate → allow through, process_market will catch it
+
                 markets.append(market)
 
             if stop_early:
@@ -1667,6 +1684,22 @@ async def process_market(app: Application, market: dict,
 
     # ── SINGLE-MARKET FOCUS LOCK (Method 4) ────────────────────────────────────
     now_utc = datetime.now(timezone.utc)
+
+    # Auto-release the lock if the locked market has already ended.
+    # This handles the case where Polymarket hasn't flipped closed=True yet
+    # but the endDate has clearly passed — prevents the bot staying locked
+    # onto a resolved market indefinitely.
+    if _locked_market_id and _locked_market_end_dt and _locked_market_end_dt <= now_utc:
+        log.info("Market lock auto-released — '%s' has expired (endDate %s)",
+                 _locked_market_title[:40], _locked_market_end_dt.isoformat())
+        await send_message(app,
+            f"🔓 Market lock released — <b>{_locked_market_title[:60]}</b> has ended.\n"
+            f"   Scanning for the next market now…")
+        _locked_market_id       = ""
+        _locked_market_title    = ""
+        _locked_market_end_dt   = None
+        _locked_market_start_dt = None
+
     if _locked_market_id and _locked_market_id != market_id:
         # We're locked onto a different market — ignore this one entirely
         log.debug("Locked on %s — ignoring %s", _locked_market_title[:30], question[:30])
@@ -1690,6 +1723,31 @@ async def process_market(app: Application, market: dict,
         except Exception:
             _locked_market_end_dt = None
         log.info("Locked onto market: %s", question[:60])
+
+    # ── EXPIRY GUARD — skip if market has already ended ─────────────────────
+    # Belt-and-suspenders: even if fetch_elon_markets let it through (API lag),
+    # refuse to process any market whose endDate is in the past.
+    if _locked_market_end_dt and _locked_market_end_dt <= now_utc:
+        log.info("Skipping expired market in process_market: %s", question[:60])
+        return False
+
+    # ── TIME REMAINING GATE — must have MIN_HOURS_REMAINING before market ends ─
+    # Ensures we never enter a market too close to resolution.
+    # Even if the market is 6 days old and has data, entering with <24h left
+    # leaves almost no time to profit (or exit at stop-loss if wrong).
+    if _locked_market_end_dt:
+        hours_remaining = (_locked_market_end_dt - now_utc).total_seconds() / 3600
+        if hours_remaining < MIN_HOURS_REMAINING:
+            if market_id not in _monitored_notified_ids:
+                _monitored_notified_ids.add(market_id)
+                await send_message(app,
+                    f"⏰ <b>Too late to enter</b> — {hours_remaining:.1f}h remaining\n"
+                    f"   Market: <i>{question[:60]}</i>\n"
+                    f"   Need >b>{MIN_HOURS_REMAINING:.0f}h</b> minimum before market ends.\n"
+                    f"   <i>Waiting for this market to end, then moving to next.</i>")
+            log.info("Too close to end (%.1fh remaining, need %.0fh): %s",
+                     hours_remaining, MIN_HOURS_REMAINING, question[:60])
+            return False
 
     # ── 12-HOUR ENTRY GATE (Method 4) ───────────────────────────────────────
     # Don't enter until the market has been running for MIN_MARKET_AGE_HOURS.
