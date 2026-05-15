@@ -186,7 +186,8 @@ CSV_COLUMNS = [
 # ──────────────────────────────────────────────────────────────────────
 
 # Markets already seen/dispatched this session (by market_id)
-seen_market_ids: set = set()
+seen_market_ids:      set  = set()  # markets we've SUCCESSFULLY TRADED (not just seen)
+_alerted_market_ids:  set  = set()  # markets we've already sent the "new market" alert for
 
 # Markets where we've already placed orders (key = question[:30])
 open_positions_by_market: dict = {}
@@ -212,7 +213,7 @@ _locked_market_id:       str           = ""    # Gamma/Polymarket market ID
 _locked_market_end_dt:   Optional[datetime] = None   # UTC end time of locked market
 _locked_market_title:    str           = ""    # human-readable (for notifications)
 _locked_market_start_dt: Optional[datetime] = None   # to compute market age hours
-_monitored_notified_ids: set           = set()  # IDs we've sent the 12h-gate notice for
+_monitored_notified_ids: dict = {}  # market_id → last_notify_timestamp (time-based, re-notifies every 15 min)
 
 # ── Method 5: dynamic prior strength (empirical Bayes) ────────────────────────
 _dynamic_beta0: float = 0.0  # 0 = use default; computed from market history when > 0
@@ -1838,8 +1839,11 @@ async def process_market(app: Application, market: dict,
     if _locked_market_end_dt:
         hours_remaining = (_locked_market_end_dt - now_utc).total_seconds() / 3600
         if hours_remaining < MIN_HOURS_REMAINING:
-            if market_id not in _monitored_notified_ids:
-                _monitored_notified_ids.add(market_id)
+            # Re-notify every 15 minutes (not just once — user wants regular status)
+            _NOTIFY_INTERVAL = 15 * 60
+            now_ts = time.time()
+            if now_ts - _monitored_notified_ids.get(market_id, 0) >= _NOTIFY_INTERVAL:
+                _monitored_notified_ids[market_id] = now_ts
                 await send_message(app, format_too_late_message(question, hours_remaining))
             log.info("Too close to end (%.1fh remaining, need %.0fh): %s — releasing lock",
                      hours_remaining, MIN_HOURS_REMAINING, question[:60])
@@ -1877,8 +1881,11 @@ async def process_market(app: Application, market: dict,
 
     if market_age_hrs < MIN_MARKET_AGE_HOURS:
         # Gate blocked — notify once then wait for next scan cycle
-        if market_id not in _monitored_notified_ids:
-            _monitored_notified_ids.add(market_id)
+        # Re-notify every 15 min — user wants regular status, not just once ever
+        _NOTIFY_INTERVAL = 15 * 60
+        now_ts = time.time()
+        if now_ts - _monitored_notified_ids.get(market_id, 0) >= _NOTIFY_INTERVAL:
+            _monitored_notified_ids[market_id] = now_ts
             await send_message(app, format_monitor_message(
                 question, market_age_hrs, early_pace,
                 end_dt=_locked_market_end_dt,
@@ -2750,20 +2757,29 @@ async def fast_market_scanner(app: Application) -> None:
             new_markets = []
             for market in markets:
                 market_id = market.get("id", market.get("conditionId", ""))
-                if not market_id or market_id in seen_market_ids:
-                    continue
+                if not market_id or market_id in _alerted_market_ids:
+                    continue  # already sent a new-market alert for this one
                 new_markets.append(market)
 
-            # Only send a Telegram message on first run or when new markets found
+            # Only send a Telegram message on first run or when NEW markets found
             if first_run:
                 report = await _build_market_scan_report(
                     markets, "Market Status (Initial Scan)"
                 )
                 await send_message(app, report)
                 first_run = False
+                # Mark all current markets as alerted so we don't re-alert next cycle
+                for m in markets:
+                    mid = m.get("id", m.get("conditionId", ""))
+                    if mid:
+                        _alerted_market_ids.add(mid)
             elif new_markets:
                 report = await _build_market_scan_report(new_markets, "🚨 NEW Market Detected")
                 await send_message(app, report)
+                for m in new_markets:
+                    mid = m.get("id", m.get("conditionId", ""))
+                    if mid:
+                        _alerted_market_ids.add(mid)
 
             # ── POSITION GATE ─────────────────────────────────────────────────
             # Don't open new trades until ALL existing positions are closed.
@@ -2775,16 +2791,19 @@ async def fast_market_scanner(app: Application) -> None:
                 continue
             # ────────────────────────────────────────────────────────────────
 
-            # Process new markets SEQUENTIALLY, soonest-expiring first.
-            # Trade up to MAX_MARKETS_PER_CYCLE markets then stop.
+            # Process ALL untrade markets sequentially, soonest-expiring first.
+            # The single-market lock in process_market() ensures only one market
+            # is worked on at a time. seen_market_ids tracks TRADED markets only.
             markets_this_cycle = 0
-            for market in new_markets:  # already sorted soonest-first by CLI
+            for market in markets:
                 market_id = market.get("id", market.get("conditionId", ""))
-                seen_market_ids.add(market_id)
+                if market_id in seen_market_ids:
+                    continue  # already traded — skip
                 log.info("Fast scan: processing '%s'",
                          market.get("question", "")[:60])
                 traded = await process_market(app, market, is_ongoing=False)
                 if traded:
+                    seen_market_ids.add(market_id)  # only mark seen AFTER successful trade
                     markets_this_cycle += 1
                     if markets_this_cycle >= MAX_MARKETS_PER_CYCLE:
                         log.info("Fast scan: reached MAX_MARKETS_PER_CYCLE (%d) — stopping.",
@@ -2830,32 +2849,31 @@ async def ongoing_market_scanner(app: Application) -> None:
             report = await _build_market_scan_report(markets, "Ongoing Market Scan")
             await send_message(app, report)
 
-            # Filter to markets we haven't traded yet
+            # Filter to markets we can still trade
             tradeable = []
             for market in markets:  # already sorted soonest-first
                 market_id  = market.get("id", market.get("conditionId", ""))
                 question   = market.get("question", "")
                 market_key = question[:30]
-                if market_key in open_positions_by_market:
-                    continue
                 if market_id in seen_market_ids:
-                    continue
+                    continue  # already traded
+                if market_key in open_positions_by_market:
+                    continue  # already in an open position
                 tradeable.append(market)
 
             if not tradeable:
-                await send_message(app, "💤 No new markets to trade this cycle.")
+                await send_message(app, "💤 Nothing to trade — all markets already in positions or traded.")
             else:
-                await send_message(app,
-                    f"⏳ Evaluating <b>{len(tradeable)}</b> market(s) — "
-                    f"trading up to {MAX_MARKETS_PER_CYCLE}, soonest-first…")
+                # Don't print '💤 no markets' if we ARE monitoring one.
+                # The monitoring message from process_market() is the status update.
                 markets_this_cycle = 0
                 for market in tradeable:
                     market_id = market.get("id", market.get("conditionId", ""))
-                    seen_market_ids.add(market_id)
                     log.info("Ongoing scan: processing '%s'",
                              market.get("question", "")[:60])
                     traded = await process_market(app, market, is_ongoing=True)
                     if traded:
+                        seen_market_ids.add(market_id)  # only mark seen AFTER successful trade
                         markets_this_cycle += 1
                         if markets_this_cycle >= MAX_MARKETS_PER_CYCLE:
                             log.info("Ongoing scan: reached MAX_MARKETS_PER_CYCLE (%d).",
