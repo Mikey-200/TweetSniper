@@ -117,7 +117,7 @@ SKIP_MARGIN_MULTIPLIER = 1.5  # DEPRECATED — kept for compat, not used (Kelly 
 MAX_MARKETS_PER_CYCLE  = int(os.getenv("MAX_MARKETS_PER_CYCLE", "1"))    # 1 = single-market lock (Method 4); raise to 2 only if lock is disabled
 MAX_OPEN_ORDERS        = int(os.getenv("MAX_OPEN_ORDERS",         "6"))   # hard cap on concurrent open positions
 MIN_MARKET_AGE_HOURS   = float(os.getenv("MIN_MARKET_AGE_HOURS",  "12"))  # 12h gate: don't enter until market is this old
-MIN_HOURS_REMAINING    = float(os.getenv("MIN_HOURS_REMAINING",   "24"))  # exit gate: don't enter if <24h remain before market ends
+MIN_HOURS_REMAINING    = float(os.getenv("MIN_HOURS_REMAINING",   "8"))   # exit gate: don't enter if <8h remain before market ends
 MIN_CONFIDENCE_PCT     = float(os.getenv("MIN_CONFIDENCE_PCT",    "60"))  # skip buckets below this fused-confidence %
 KELLY_FRACTION         = float(os.getenv("KELLY_FRACTION",        "0.25")) # fraction of full Kelly (0.25 = quarter-Kelly)
 MARKET_HISTORY_FILE    = os.getenv("MARKET_HISTORY_FILE", "/app/data/market_history.json")
@@ -693,24 +693,125 @@ def format_skip_reason(label: str, reason: str, conf: int = 0) -> str:
     return f"⏭ <b>Skipping {label}:</b> {reason}{conf_tag}"
 
 
-def format_monitor_message(title: str, market_age_hrs: float,
-                           pace: Optional[dict]) -> str:
-    """Notification sent when 12h gate blocks entry."""
-    wait_hrs = max(0.0, MIN_MARKET_AGE_HOURS - market_age_hrs)
-    pace_line = ""
+def format_monitor_message(
+    title: str,
+    market_age_hrs: float,
+    pace: Optional[dict],
+    end_dt: Optional[datetime] = None,
+    market: Optional[dict] = None,
+) -> str:
+    """Rich monitoring notification sent when the 12h age gate blocks entry.
+
+    Shows: market age, entry ETA (exact time), early bucket preview,
+    and time remaining in the market.
+    """
+    from datetime import timezone as _tz
+    wait_hrs  = max(0.0, MIN_MARKET_AGE_HOURS - market_age_hrs)
+    now_utc   = datetime.now(timezone.utc)
+
+    # Entry ETA — local clock calculation
+    entry_eta_str = ""
+    if wait_hrs > 0:
+        entry_time = now_utc + timedelta(hours=wait_hrs)
+        # Show as UTC+1 (Nigeria WAT)
+        entry_wat  = entry_time + timedelta(hours=1)
+        entry_eta_str = f"  ({entry_wat.strftime('%d %b %H:%M')} Nigeria time)"
+
+    # Hours remaining in the market
+    hrs_left_str = ""
+    if end_dt:
+        hrs_left = max(0.0, (end_dt - now_utc).total_seconds() / 3600)
+        if hrs_left < 24:
+            hrs_left_str = f"\n  ⏰ Market ends in: <b>{hrs_left:.1f}h</b>"
+        else:
+            hrs_left_str = f"\n  ⏰ Market ends in: <b>{hrs_left/24:.1f}d</b> ({hrs_left:.0f}h)"
+
+    # Early pace block
+    pace_block = ""
     if pace:
-        proj   = int(pace.get("projected", 0))
-        total  = int(pace.get("total", 0))
-        cred_z = pace.get("credibility_z", 0.0)
-        pace_line = (
-            f"\n  Early data: {total} tweets so far ({cred_z:.0%} reliable)"
-            f"\n  Early estimate: ~{proj} tweets"
+        proj      = int(pace.get("projected", 0))
+        total     = int(pace.get("total", 0))
+        cred_z    = pace.get("credibility_z", 0.0)
+        sigma     = pace.get("sigma", 0.0)
+        hrs_rem_p = pace.get("hours_remaining", 0.0)
+        proj_lo   = max(0, proj - int(sigma))
+        proj_hi   = proj + int(sigma)
+        pace_block = (
+            f"\n\n📊 <b>Early pace snapshot</b>"
+            f"\n  Tweets so far: <b>{total}</b>  ({cred_z:.0%} live data weight)"
+            f"\n  Projected total: <b>~{proj} tweets</b>  (range: {proj_lo}–{proj_hi})"
+            f"\n  Time left in market: {hrs_rem_p:.1f}h"
         )
+
+        # Bucket preview from market dict
+        if market and sigma > 0:
+            try:
+                outcomes_raw = market.get("outcomes", "[]")
+                prices_raw   = market.get("outcomePrices", "[]")
+                outcome_labels = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+                price_list     = json.loads(prices_raw)   if isinstance(prices_raw,   str) else prices_raw
+                nd = NormalDist(mu=float(proj), sigma=float(sigma))
+                parsed_buckets = []
+                for idx, lbl in enumerate(outcome_labels):
+                    b = parse_bucket_label(lbl)
+                    if b is None:
+                        continue
+                    lo, hi = b
+                    p = (1 - nd.cdf(lo - 0.5)) if hi == 9999 else (nd.cdf(hi + 0.5) - nd.cdf(lo - 0.5))
+                    try:
+                        price_val = float(price_list[idx]) if idx < len(price_list) else 0.0
+                    except Exception:
+                        price_val = 0.0
+                    parsed_buckets.append((p, lbl, lo, price_val))
+                parsed_buckets.sort(key=lambda x: x[0], reverse=True)
+
+                # Mark peak bucket
+                peak_lbl = ""
+                for p, lbl, lo, _ in parsed_buckets:
+                    b = parse_bucket_label(lbl)
+                    if b and b[0] <= proj <= b[1]:
+                        peak_lbl = lbl
+                        break
+
+                bucket_lines = []
+                for p, lbl, lo, price_val in parsed_buckets[:6]:
+                    icon = "🎯" if lbl == peak_lbl else ("✅" if p >= 0.10 else "⬜")
+                    price_str = f"  @${price_val:.3f}" if price_val > 0 else ""
+                    peak_tag  = "  ← PEAK (proj lands here)" if lbl == peak_lbl else ""
+                    bucket_lines.append(
+                        f"  {icon} <b>{lbl}</b>  {p*100:.1f}%{price_str}{peak_tag}"
+                    )
+                if bucket_lines:
+                    pace_block += (
+                        f"\n\n🪣 <b>Bucket preview</b> (based on early data — will sharpen):"
+                        + "".join(f"\n{line}" for line in bucket_lines)
+                        + "\n  <i>⚠️ Early estimate — reliability improves with more data</i>"
+                    )
+            except Exception:
+                pass  # bucket preview is best-effort
+
+    age_tag = (
+        f"<b>{market_age_hrs:.1f}h</b> old" if market_age_hrs >= 1
+        else f"<b>{market_age_hrs*60:.0f} minutes</b> old"
+    )
+
     return (
-        f"📍 <b>Monitoring</b> — {title[:50]}\n"
-        f"  Market is only {market_age_hrs:.1f}h old — need {MIN_MARKET_AGE_HOURS:.0f}h minimum\n"
-        f"  ⏳ Will re-assess in ~{wait_hrs:.1f}h"
-        f"{pace_line}"
+        f"📍 <b>Locked & Monitoring</b>"
+        f"\n  <i>{title[:60]}</i>"
+        f"\n\n🕒 Market age: {age_tag}  (need <b>{MIN_MARKET_AGE_HOURS:.0f}h</b> minimum)"
+        f"\n⏳ <b>Entering in ~{wait_hrs:.1f}h</b>{entry_eta_str}"
+        f"{hrs_left_str}"
+        f"{pace_block}"
+    )
+
+
+def format_too_late_message(title: str, hours_remaining: float) -> str:
+    """Notification sent when the market has <MIN_HOURS_REMAINING left and we skip it."""
+    return (
+        f"⏩ <b>Market skipped — too close to end</b>"
+        f"\n  <i>{title[:60]}</i>"
+        f"\n  Only <b>{hours_remaining:.1f}h</b> remaining (need >{MIN_HOURS_REMAINING:.0f}h)"
+        f"\n\n  🔓 Lock released — scanning for the next market now…"
     )
 
 
@@ -1733,20 +1834,20 @@ async def process_market(app: Application, market: dict,
 
     # ── TIME REMAINING GATE — must have MIN_HOURS_REMAINING before market ends ─
     # Ensures we never enter a market too close to resolution.
-    # Even if the market is 6 days old and has data, entering with <24h left
-    # leaves almost no time to profit (or exit at stop-loss if wrong).
+    # If the market is ending soon, release the lock so the bot moves to next.
     if _locked_market_end_dt:
         hours_remaining = (_locked_market_end_dt - now_utc).total_seconds() / 3600
         if hours_remaining < MIN_HOURS_REMAINING:
             if market_id not in _monitored_notified_ids:
                 _monitored_notified_ids.add(market_id)
-                await send_message(app,
-                    f"⏰ <b>Too late to enter</b> — {hours_remaining:.1f}h remaining\n"
-                    f"   Market: <i>{question[:60]}</i>\n"
-                    f"   Need >b>{MIN_HOURS_REMAINING:.0f}h</b> minimum before market ends.\n"
-                    f"   <i>Waiting for this market to end, then moving to next.</i>")
-            log.info("Too close to end (%.1fh remaining, need %.0fh): %s",
+                await send_message(app, format_too_late_message(question, hours_remaining))
+            log.info("Too close to end (%.1fh remaining, need %.0fh): %s — releasing lock",
                      hours_remaining, MIN_HOURS_REMAINING, question[:60])
+            # Release the lock so the scanner picks up the NEXT market next cycle
+            _locked_market_id       = ""
+            _locked_market_title    = ""
+            _locked_market_end_dt   = None
+            _locked_market_start_dt = None
             return False
 
     # ── 12-HOUR ENTRY GATE (Method 4) ───────────────────────────────────────
@@ -1764,7 +1865,10 @@ async def process_market(app: Application, market: dict,
             # Fetch early pace for context
             early_pace = await fetch_elon_pace(market_slug=market.get("slug", ""))
             await send_message(app, format_monitor_message(
-                question, market_age_hrs, early_pace))
+                question, market_age_hrs, early_pace,
+                end_dt=_locked_market_end_dt,
+                market=market,
+            ))
         return False  # not ready to trade yet
     # ──────────────────────────────────────────────────────────────────────
 
