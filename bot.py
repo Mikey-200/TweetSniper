@@ -2001,34 +2001,53 @@ async def process_market(app: Application, market: dict,
     #   e.g. 65-89 @ $0.685 with 98.9% confidence → +44% expected edge.
     # Skipping this was causing the bot to find "no valid buckets" every cycle.
     filtered_tokens = []
+    skipped_summary = []  # collect skip reasons to report together, once, rate-limited
     for tok in selected_tokens:
         token_id, label, slot_idx, low, high, p_fused, conf = tok[:5] + (tok[5] if len(tok) > 5 else 0.0,) + (tok[6] if len(tok) > 6 else 50,)
         token_price = next(
             (float(t["price"]) for t in tokens if t["token_id"] == token_id), 0.0
         )
-        # Only skip if overpriced AND low confidence — high confidence justifies the premium
         # Hard cap: never pay more than $0.70, even at very high confidence.
-        # Above $0.70 the max possible return is only 43% — too thin given market risk.
         if token_price > 0.70 and slot_idx == 0:
-            reason = f"price ${token_price:.3f} > $0.70 hard cap — max upside too thin"
-            await send_message(app, format_skip_reason(label, reason, conf))
-            log.info("CENTER bucket '%s' skipped (hard cap): %s", label, reason)
+            skipped_summary.append((label, token_price, conf,
+                f"price ${token_price:.3f} > $0.70 hard cap "
+                f"(max return: {(1/token_price - 1)*100:.0f}%) — "
+                f"waiting for price to drop"))
+            log.info("CENTER bucket '%s' skipped (hard cap $%.3f)", label, token_price)
             continue
-        # Also skip if overpriced (>$0.50) AND low confidence (<80%)
+        # Skip if overpriced (>$0.50) AND low confidence (<80%)
         if token_price > 0.50 and slot_idx == 0 and p_fused < 0.80:
-            reason = (
-                f"price ${token_price:.3f} > $0.50 and confidence only {conf}% "
-                f"— return <2× with uncertain outcome"
-            )
-            await send_message(app, format_skip_reason(label, reason, conf))
-            log.info("CENTER bucket '%s' skipped: %s", label, reason)
+            skipped_summary.append((label, token_price, conf,
+                f"price ${token_price:.3f} > $0.50 with only {conf}% confidence "
+                f"— return <2× with uncertain outcome"))
+            log.info("CENTER bucket '%s' skipped (price=%.3f conf=%d%%)", label, token_price, conf)
             continue
         filtered_tokens.append(tok)
     selected_tokens = filtered_tokens
-    # ─────────────────────────────────────────────────────────────────────
+
+    # If any buckets were skipped, send ONE rate-limited message with full context
+    if skipped_summary:
+        _skip_key = f"skip_{market_id}"
+        _NOTIFY_INTERVAL = 15 * 60
+        now_ts = time.time()
+        if now_ts - _monitored_notified_ids.get(_skip_key, 0) >= _NOTIFY_INTERVAL:
+            _monitored_notified_ids[_skip_key] = now_ts
+            hrs_left = (_locked_market_end_dt - datetime.now(timezone.utc)).total_seconds() / 3600 \
+                       if _locked_market_end_dt else 0
+            skip_lines = "\n".join(
+                f"   ⏭ <b>{lbl}</b> @ ${pr:.3f}  ({c}% conf)  — {rsn}"
+                for lbl, pr, c, rsn in skipped_summary
+            )
+            await send_message(app,
+                f"📍 <b>{question[:55]}</b>\n"
+                f"   ⏰ Ends in: {hrs_left:.1f}h\n\n"
+                f"{skip_lines}\n\n"
+                f"   💡 All viable buckets skipped — monitoring for better entry.\n"
+                f"   Will re-check every ~5 min.")
+    # ─────────────────────────────────────────────────────────────────────────
 
     if not selected_tokens:
-        # Rate-limit this warning — don't spam every 60 seconds
+        # Separate rate-limit for the "no valid buckets at all" case
         _no_bucket_key = f"no_buckets_{market_id}"
         _NOTIFY_INTERVAL = 15 * 60
         now_ts = time.time()
@@ -2036,8 +2055,9 @@ async def process_market(app: Application, market: dict,
             _monitored_notified_ids[_no_bucket_key] = now_ts
             await send_message(app,
                 f"⚠️ <b>No valid buckets</b> — <i>{question[:60]}</i>\n"
-                f"   All buckets were filtered (overpriced + low confidence, or <{MIN_CONFIDENCE_PCT:.0f}% confidence).\n"
+                f"   All buckets filtered (overpriced / low confidence / <{MIN_CONFIDENCE_PCT:.0f}% conf).\n"
                 f"   Will re-check in ~15 min.")
+
         log.warning("No valid buckets for: %s", question[:60])
         return False
 
