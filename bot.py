@@ -1852,25 +1852,41 @@ async def process_market(app: Application, market: dict,
 
     # ── 12-HOUR ENTRY GATE (Method 4) ───────────────────────────────────────
     # Don't enter until the market has been running for MIN_MARKET_AGE_HOURS.
-    # This ensures we have real data before committing capital.
-    if _locked_market_start_dt:
+    #
+    # WHY WE DON'T USE Gamma API's startDate:
+    #   The Gamma API returns 'createdAt' — the date Polymarket created the
+    #   market record, NOT when tweet counting started. Using it showed "0 minutes
+    #   old" for markets that were already 28+ hours into their tracking period.
+    #
+    # AUTHORITATIVE SOURCE: XTracker hours_elapsed.
+    #   Computed from the tracking period's actual startDate.
+    #   Verified: all Elon tweet markets start at 16:00:00 UTC (5pm Nigeria WAT).
+    #
+    # Pace is cached for 10 minutes, so fetching it every scan cycle is cheap.
+    early_pace = await fetch_elon_pace(market_slug=market.get("slug", ""))
+
+    # Use XTracker hours_elapsed as the definitive market age
+    if early_pace and early_pace.get("hours_elapsed", 0) > 0:
+        market_age_hrs = early_pace["hours_elapsed"]
+        # Sync _locked_market_start_dt so display is consistent
+        _locked_market_start_dt = now_utc - timedelta(hours=market_age_hrs)
+    elif _locked_market_start_dt:
         market_age_hrs = (now_utc - _locked_market_start_dt).total_seconds() / 3600
     else:
-        market_age_hrs = MIN_MARKET_AGE_HOURS  # assume old enough if unknown
+        market_age_hrs = MIN_MARKET_AGE_HOURS  # unknown → assume ready
 
     if market_age_hrs < MIN_MARKET_AGE_HOURS:
-        # Gate blocked — notify once then wait
+        # Gate blocked — notify once then wait for next scan cycle
         if market_id not in _monitored_notified_ids:
             _monitored_notified_ids.add(market_id)
-            # Fetch early pace for context
-            early_pace = await fetch_elon_pace(market_slug=market.get("slug", ""))
             await send_message(app, format_monitor_message(
                 question, market_age_hrs, early_pace,
                 end_dt=_locked_market_end_dt,
                 market=market,
             ))
         return False  # not ready to trade yet
-    # ──────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
+
 
     # ─── EXTRACT OUTCOME TOKENS FROM GAMMA API RESPONSE ─────────────────
     # VERIFIED from live CLI output:
