@@ -1991,17 +1991,27 @@ async def process_market(app: Application, market: dict,
             for i, t in enumerate(tokens[:BUCKETS_TO_BUY])
         ]
 
-    # ── IMPROVEMENT #3: Skip CENTER bucket if YES price > $0.50 ─────────
-    # If the market has already priced in a bucket too heavily (>50¢), buying
-    # it gives <2× return even if it resolves YES. Skip to the next bucket up.
+    # ── CENTER BUCKET PRICE FILTER ──────────────────────────────────────────
+    # Skip the center bucket if it is overpriced (>$0.50) AND confidence is low.
+    # Rationale: at $0.50 the max win is 2× — below that threshold the upside
+    # doesn't justify the risk WHEN uncertainty is high.
+    #
+    # EXCEPTION (key fix): If the fused probability is ≥ 80%, the premium price
+    # is JUSTIFIED — the edge is still strongly positive:
+    #   e.g. 65-89 @ $0.685 with 98.9% confidence → +44% expected edge.
+    # Skipping this was causing the bot to find "no valid buckets" every cycle.
     filtered_tokens = []
     for tok in selected_tokens:
         token_id, label, slot_idx, low, high, p_fused, conf = tok[:5] + (tok[5] if len(tok) > 5 else 0.0,) + (tok[6] if len(tok) > 6 else 50,)
         token_price = next(
             (float(t["price"]) for t in tokens if t["token_id"] == token_id), 0.0
         )
-        if token_price > 0.50 and slot_idx == 0:  # slot 0 = CENTER bucket
-            reason = f"price ${token_price:.3f} > $0.50 — return < 2x, not worth the risk"
+        # Only skip if overpriced AND low confidence — high confidence justifies the premium
+        if token_price > 0.50 and slot_idx == 0 and p_fused < 0.80:
+            reason = (
+                f"price ${token_price:.3f} > $0.50 and confidence only {conf}% "
+                f"— return <2× with uncertain outcome"
+            )
             await send_message(app, format_skip_reason(label, reason, conf))
             log.info("CENTER bucket '%s' skipped: %s", label, reason)
             continue
@@ -2010,8 +2020,17 @@ async def process_market(app: Application, market: dict,
     # ─────────────────────────────────────────────────────────────────────
 
     if not selected_tokens:
-        await send_message(app,
-            f"⚠️ No valid buckets for <b>{question[:60]}</b>")
+        # Rate-limit this warning — don't spam every 60 seconds
+        _no_bucket_key = f"no_buckets_{market_id}"
+        _NOTIFY_INTERVAL = 15 * 60
+        now_ts = time.time()
+        if now_ts - _monitored_notified_ids.get(_no_bucket_key, 0) >= _NOTIFY_INTERVAL:
+            _monitored_notified_ids[_no_bucket_key] = now_ts
+            await send_message(app,
+                f"⚠️ <b>No valid buckets</b> — <i>{question[:60]}</i>\n"
+                f"   All buckets were filtered (overpriced + low confidence, or <{MIN_CONFIDENCE_PCT:.0f}% confidence).\n"
+                f"   Will re-check in ~15 min.")
+        log.warning("No valid buckets for: %s", question[:60])
         return False
 
     # Pre-trade announcement: tell the user WHAT we're about to buy
