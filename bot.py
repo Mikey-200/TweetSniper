@@ -2025,39 +2025,48 @@ async def process_market(app: Application, market: dict,
         filtered_tokens.append(tok)
     selected_tokens = filtered_tokens
 
-    # If any buckets were skipped, send ONE rate-limited message with full context
-    if skipped_summary:
-        _skip_key = f"skip_{market_id}"
-        _NOTIFY_INTERVAL = 15 * 60
-        now_ts = time.time()
-        if now_ts - _monitored_notified_ids.get(_skip_key, 0) >= _NOTIFY_INTERVAL:
-            _monitored_notified_ids[_skip_key] = now_ts
-            hrs_left = (_locked_market_end_dt - datetime.now(timezone.utc)).total_seconds() / 3600 \
-                       if _locked_market_end_dt else 0
-            skip_lines = "\n".join(
-                f"   ⏭ <b>{lbl}</b> @ ${pr:.3f}  ({c}% conf)  — {rsn}"
-                for lbl, pr, c, rsn in skipped_summary
+    # ── UNIFIED ANALYSIS NOTIFICATION ───────────────────────────────────────
+    # All notifications for this market share ONE rate-limit window (15 min).
+    # This ensures the user ALWAYS sees the full pace analysis before seeing
+    # the skip/trade decision — whether or not a trade fires.
+    _analysis_key = f"analysis_{market_id}"
+    _ANALYSIS_INTERVAL = 15 * 60
+    _now_ts = time.time()
+    _analysis_due = (_now_ts - _monitored_notified_ids.get(_analysis_key, 0) >= _ANALYSIS_INTERVAL)
+
+    if skipped_summary and _analysis_due:
+        # Build embedded pace context (same info as the pre-buy alert)
+        _pace_ctx = ""
+        if pace:
+            _total   = int(pace.get("total", 0))
+            _hrs_rem = pace.get("hours_remaining", 0)
+            _rate    = pace.get("hourly_avg", 0)
+            _proj    = pace.get("projected", 0)
+            _sigma   = pace.get("sigma", 0)
+            _cred    = pace.get("credibility_z", 0.5) * 100
+            _conf_lbl = ("High" if _cred >= 60 else "Medium" if _cred >= 35 else "Low")
+            _pace_ctx = (
+                f"   📊 {_total} tweets so far  ·  {_hrs_rem:.1f}h left\n"
+                f"   Tweeting at {_rate:.1f}/hr  ·  Confidence: {_conf_lbl} — {_cred:.0f}% from live data\n"
+                f"   Projected: {_proj:.0f} tweets  (likely range: {_proj-_sigma:.0f}–{_proj+_sigma:.0f})\n\n"
             )
-            await send_message(app,
-                f"📍 <b>{question[:55]}</b>\n"
-                f"   ⏰ Ends in: {hrs_left:.1f}h\n\n"
-                f"{skip_lines}\n\n"
-                f"   💡 All viable buckets skipped — monitoring for better entry.\n"
-                f"   Will re-check every ~5 min.")
+        _hrs_left = (_locked_market_end_dt - datetime.now(timezone.utc)).total_seconds() / 3600 \
+                    if _locked_market_end_dt else 0
+        _skip_lines = "\n".join(
+            f"   ⏭ <b>{lbl}</b> @ ${pr:.3f}  ({c}% conf)  — {rsn}"
+            for lbl, pr, c, rsn in skipped_summary
+        )
+        _monitored_notified_ids[_analysis_key] = _now_ts
+        _dry = " [SIM]" if DRY_RUN else ""
+        await send_message(app,
+            f"📍 <b>{question[:55]}</b>{_dry}\n"
+            f"   ⏰ Ends in: {_hrs_left:.1f}h\n\n"
+            f"{_pace_ctx}"
+            f"{_skip_lines}\n\n"
+            f"   💡 Monitoring for better entry — will re-check every ~5 min.")
     # ─────────────────────────────────────────────────────────────────────────
 
     if not selected_tokens:
-        # Separate rate-limit for the "no valid buckets at all" case
-        _no_bucket_key = f"no_buckets_{market_id}"
-        _NOTIFY_INTERVAL = 15 * 60
-        now_ts = time.time()
-        if now_ts - _monitored_notified_ids.get(_no_bucket_key, 0) >= _NOTIFY_INTERVAL:
-            _monitored_notified_ids[_no_bucket_key] = now_ts
-            await send_message(app,
-                f"⚠️ <b>No valid buckets</b> — <i>{question[:60]}</i>\n"
-                f"   All buckets filtered (overpriced / low confidence / <{MIN_CONFIDENCE_PCT:.0f}% conf).\n"
-                f"   Will re-check in ~15 min.")
-
         log.warning("No valid buckets for: %s", question[:60])
         return False
 
@@ -2069,14 +2078,11 @@ async def process_market(app: Application, market: dict,
             (float(t["price"]) for t in tokens if t["token_id"] == token_id), 0.0
         )
         planned.append((label, token_price))
-    # Rate-limit the pre-buy alert — don't spam it every 60s if the SIM/trade fails.
-    # Uses same 15-min window as monitoring messages.
-    _prebuy_key = f"prebuy_{market_id}"
-    _PREBUY_INTERVAL = 15 * 60
-    _now_ts = time.time()
-    if _now_ts - _monitored_notified_ids.get(_prebuy_key, 0) >= _PREBUY_INTERVAL:
-        _monitored_notified_ids[_prebuy_key] = _now_ts
+    # Use the SAME analysis key — so alert and skip are always on the same 15-min clock
+    if _analysis_due:
+        _monitored_notified_ids[_analysis_key] = _now_ts
         await send_pre_buy_alert(app, market, pace, tokens, planned, is_ongoing)
+
 
     if DRY_RUN:
         # DRY_RUN does NOT need the CLOB client — simulation only
