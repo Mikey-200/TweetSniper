@@ -2293,7 +2293,9 @@ async def process_market(app: Application, market: dict,
         # size in SHARES, not USD
         raw_shares  = bet_usd / best_ask
         size_shares = math.ceil(raw_shares * 10_000) / 10_000
-        tp_target   = best_ask * tp_mult
+        # Prediction markets cap at $1.00 — TP at $0.95 exits near certainty.
+        # This matches SIM behavior and is the correct strategy for Polymarket.
+        tp_target   = min(best_ask * tp_mult, 0.95)
 
         log.info("Placing order: bucket=%s token=%s… price=%.4f size=%.4f",
                  label, token_id[:16], exec_price, size_shares)
@@ -2461,7 +2463,7 @@ async def execute_tp(order_id: str, app: Application,
                 row["sell_order_id"] = sell_order_id
                 row["profit_usd"]    = round(profit_usd, 4)
                 row["profit_pct"]    = round(profit_pct, 2)
-                row["buy_status"]    = "CLOSED"
+                row["buy_status"]    = "TP"  # TP hit — closed for profit
                 break
         rewrite_csv(rows)
 
@@ -2720,6 +2722,163 @@ async def tp_backup_poll(app: Application) -> None:
             except Exception as e:
                 log.debug("tp_backup_poll error for %s: %s", order_id[:12], e)
 
+
+# ──────────────────────────────────────────────────────────────────────
+# SECTION 14 — MARKET RESOLUTION CHECKER
+# ──────────────────────────────────────────────────────────────────────
+
+async def market_resolution_checker(app: Application) -> None:
+    """Detect when the locked market has resolved and close all positions.
+
+    Runs every 5 minutes. Logic:
+    1. When _locked_market_end_dt is passed (+ 10 min buffer), market is over.
+    2. Fetch all tokens for that market from Gamma API.
+    3. Identify the winning bucket: token with highest price (>= 0.80).
+    4. Close all open positions:
+       - Our bucket = winner → execute_tp at current price
+       - Our bucket = loser  → execute_stop_loss at near-zero price
+    5. Send a clear resolution notification with the winning bucket + P&L.
+    6. Release the market lock so the scanner picks up the next market.
+
+    Works identically for SIM and LIVE — execute_tp/execute_stop_loss
+    handle the real vs. simulated close difference internally.
+    """
+    global _locked_market_id, _locked_market_end_dt, \
+           _locked_market_title, _locked_market_start_dt, _sim_balance
+
+    await asyncio.sleep(60)  # let WS and scanners start first
+    while True:
+        await asyncio.sleep(300)  # check every 5 minutes
+
+        if not _locked_market_id or not _locked_market_end_dt:
+            continue
+
+        now_utc = datetime.now(timezone.utc)
+        # Wait 10 minutes past end time for on-chain resolution to propagate
+        if now_utc < _locked_market_end_dt + timedelta(minutes=10):
+            continue
+
+        log.info("Resolution checker: %s ended — checking resolution",
+                 _locked_market_title)
+        try:
+            # Fetch current market data (active_only=False to still find resolved markets)
+            markets = await fetch_elon_markets(active_only=False, max_age_minutes=None)
+            locked_market = next(
+                (m for m in markets
+                 if m.get("id", m.get("conditionId", "")) == _locked_market_id),
+                None
+            )
+
+            tokens: list = []
+            if locked_market:
+                tokens = locked_market.get("tokens") or []
+
+            # Fallback: use token_ids from our open positions for that market
+            if not tokens:
+                market_key = (_locked_market_title or "")[:30]
+                for pos in open_positions.values():
+                    if pos.get("market_key", "")[:30] == market_key[:30]:
+                        tokens.append({
+                            "token_id": pos["token_id"],
+                            "outcome":  pos.get("bucket", "?"),
+                            "price":    "0.5",
+                        })
+
+            if not tokens:
+                log.warning("Resolution checker: no token data for %s — will retry",
+                            _locked_market_id)
+                continue
+
+            # Find the winning token (highest price; must be >= 0.80 to act)
+            def tok_price(t):
+                try:
+                    return float(t.get("price", 0) or 0)
+                except Exception:
+                    return 0.0
+
+            tokens_sorted = sorted(tokens, key=tok_price, reverse=True)
+            top_token     = tokens_sorted[0]
+            top_price     = tok_price(top_token)
+            winner_tid    = top_token.get("token_id", "")
+            winner_label  = top_token.get("outcome", "Unknown")
+
+            if top_price < 0.80:
+                log.info("Resolution checker: top price %.3f < 0.80 — not yet "
+                         "resolved, will retry in 5 min", top_price)
+                continue
+
+            # ── Close all positions in this market ────────────────────────
+            market_key   = (_locked_market_title or "")[:30]
+            tok_ids_here = {t.get("token_id", "") for t in tokens}
+            closed_msgs  = []
+
+            for order_id, pos in list(open_positions.items()):
+                # Match by market_key OR by token_id belonging to this market
+                pos_mkey = pos.get("market_key", "")[:30]
+                pos_tid  = pos.get("token_id", "")
+                if pos_mkey != market_key[:30] and pos_tid not in tok_ids_here:
+                    continue
+
+                is_winner    = (pos_tid == winner_tid)
+                tok_data     = next((t for t in tokens
+                                     if t.get("token_id") == pos_tid), None)
+                current_price = tok_price(tok_data) if tok_data else (
+                    1.0 if is_winner else 0.01
+                )
+
+                bucket = pos.get("bucket", "?")
+                snum   = pos.get("session_num", "?")
+
+                if is_winner:
+                    log.info("Resolution: #%s %s WON @ %.3f", snum, bucket, current_price)
+                    await execute_tp(order_id, app, current_price)
+                    profit_usd = (current_price - pos["buy_price"]) * pos["size_shares"]
+                    closed_msgs.append(
+                        f"  ✅ <b>#{snum} {bucket}</b>  "
+                        f"${pos['buy_price']:.3f} → ${current_price:.3f}  "
+                        f"<b>${profit_usd:+.2f}</b>"
+                    )
+                    if pos.get("is_sim"):
+                        _sim_balance += current_price * pos["size_shares"]
+                else:
+                    log.info("Resolution: #%s %s LOST @ %.3f", snum, bucket, current_price)
+                    await execute_stop_loss(order_id, app, max(current_price, 0.01))
+                    loss_usd = (current_price - pos["buy_price"]) * pos["size_shares"]
+                    closed_msgs.append(
+                        f"  ❌ <b>#{snum} {bucket}</b>  "
+                        f"${pos['buy_price']:.3f} → ${current_price:.3f}  "
+                        f"<b>${loss_usd:+.2f}</b>"
+                    )
+
+            # ── Build resolution notification ─────────────────────────────
+            sim_bal_line = (
+                f"\n  💰 Virtual balance: <b>${_sim_balance:.2f}</b>"
+                if DRY_RUN else ""
+            )
+            pos_section = (
+                "\n" + "\n".join(closed_msgs)
+                if closed_msgs else "\n  💤 No position was held in this market."
+            )
+            dry_tag = " [SIM]" if DRY_RUN else ""
+
+            await send_message(app,
+                f"🏁 <b>Market Resolved{dry_tag}!</b>\n"
+                f"  {(_locked_market_title or 'Unknown market')[:65]}\n\n"
+                f"  🏆 Winning bucket: <b>{winner_label}</b>  (${top_price:.3f})\n"
+                f"{pos_section}"
+                f"{sim_bal_line}\n\n"
+                f"  📋 /history for full P&L  ·  📊 /pnl for totals"
+            )
+
+            # ── Release market lock ───────────────────────────────────────
+            log.info("Resolution checker: releasing lock for %s", _locked_market_title)
+            _locked_market_id       = ""
+            _locked_market_end_dt   = None
+            _locked_market_title    = ""
+            _locked_market_start_dt = None
+
+        except Exception as e:
+            log.error("market_resolution_checker error: %s", e, exc_info=True)
 
 # ──────────────────────────────────────────────────────────────────────
 # SECTION 14 — FILL MONITOR
@@ -3104,8 +3263,9 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         f"🎯 <b>TweetSniper</b>  ·  {mode_tag}\n"
         f"{dry_tag}"
-        f"Balance: <b>${bal:.2f} USDC</b>\n"
-        f"Positions open: <b>{len(open_positions)}</b>\n"
+        f"Balance: <b>${bal:.2f} USDC</b>" +
+        (f"  |  🎮 Virtual: <b>${_sim_balance:.2f}</b>" if DRY_RUN else "") +
+        f"\nPositions open: <b>{len(open_positions)}</b>\n"
         f"Markets tracked: <b>{len(seen_market_ids)}</b>\n"
         f"\nTap a button 👇",
         parse_mode="HTML",
@@ -3169,9 +3329,17 @@ async def balance_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception:
         eoa_addr = "invalid key"
 
+    sim_line = ""
+    if DRY_RUN:
+        sim_start = float(os.getenv("SIM_BALANCE_USD", "10.0"))
+        sim_line = (
+            f"\n  🎮 <b>SIM wallet: ${_sim_balance:.2f}</b>  "
+            f"(started ${sim_start:.2f})\n"
+        )
     await msg.reply_text(
         f"💰 <b>Balances (on-chain)</b>\n"
-        f"  Trading balance: <b>${proxy_bal:.2f} USDC</b>\n\n"
+        f"  Trading balance: <b>${proxy_bal:.2f} USDC</b>\n"
+        f"{sim_line}\n"
         f"  Proxy wallet: <code>{PROXY_WALLET[:24]}…</code>\n"
         f"  EOA (signing): <code>{eoa_addr[:24]}…</code>\n\n"
         f"  {'✅ Sufficient to trade' if proxy_bal >= ORDER_SIZE_USD else '⚠️ Insufficient — deposit more USDC'}",
@@ -3214,9 +3382,10 @@ async def history_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
         status_emoji = (
             "🎮" if status == "SIM"
-            else "✅" if status == "TP"
+            else "✅" if status in ("TP", "CLOSED")  # TP or resolved WIN
             else "🛑" if status == "STOP_LOSS"
             else "⏳" if status == "OPEN"
+            else "🏁" if status == "RESOLVED"
             else "❓"
         )
         profit_str = f"  <b>${float(profit):+.2f} ({float(pct):+.1f}%)</b>" if profit and pct else ""
@@ -3932,10 +4101,67 @@ async def restore_sim_state_from_csv() -> None:
     pnl_summary["total_invested"]  = invested
     pnl_summary["total_returned"]  = returned
 
+    # Reconstruct _sim_balance from SIM-prefixed CSV rows
+    global _sim_balance
+    _sim_balance = float(os.getenv("SIM_BALANCE_USD", "10.0"))
+    for row in rows:
+        if not str(row.get("buy_order_id", "")).startswith("SIM-"):
+            continue
+        try:
+            _sim_balance -= float(row.get("cost_usd", 0) or 0)
+            sp = row.get("sell_price", "")
+            ss = row.get("size_shares", "")
+            if sp and ss:
+                _sim_balance += float(sp) * float(ss)
+        except (ValueError, TypeError):
+            pass
+    _sim_balance = max(0.0, _sim_balance)
+
+    # Restore open SIM positions to open_positions so the TP/SL monitor
+    # and resolution checker can watch them after a restart.
+    for row in rows:
+        if row.get("buy_status", "") != "SIM":
+            continue
+        if row.get("profit_usd") or row.get("sell_price"):
+            continue  # already closed
+        order_id = row.get("buy_order_id", "")
+        token_id = row.get("token_id", "")
+        if not order_id or not token_id or order_id in open_positions:
+            continue
+        try:
+            buy_price   = float(row.get("buy_price",   0) or 0)
+            size_shares = float(row.get("size_shares", 0) or 0)
+            tp_raw      = row.get("tp_target", "")
+            tp_target   = float(tp_raw) if tp_raw else min(buy_price * 2.0, 0.95)
+            snum        = int(row.get("session_num",   0) or 0)
+            mkey        = row.get("market_key",        "")[:30]
+            cost        = float(row.get("cost_usd",    ORDER_SIZE_USD) or ORDER_SIZE_USD)
+        except (ValueError, TypeError):
+            continue
+        open_positions[order_id] = {
+            "order_id":    order_id,
+            "token_id":    token_id,
+            "bucket":      row.get("bucket", "?"),
+            "buy_price":   buy_price,
+            "tp_target":   tp_target,
+            "sl_price":    buy_price * (1 - STOP_LOSS_PCT),
+            "size_shares": size_shares,
+            "cost_usd":    cost,
+            "session_num": snum,
+            "market_key":  mkey,
+            "market_question": row.get("market_question", "Restored SIM"),
+            "placed_at":   time.time(),
+            "is_sim":      True,
+        }
+        if mkey not in open_positions_by_market:
+            open_positions_by_market[mkey] = order_id
+        log.info("Restored SIM position to open_positions: #%d %s @ $%.3f",
+                 snum, row.get("bucket", "?"), buy_price)
+
     log.info(
-        "restore_sim_state: %d trades loaded, session_counter=%d, "
-        "invested=$%.2f, returned=$%.2f, W/L=%d/%d",
-        placed, session_counter, invested, returned, wins, losses,
+        "restore_sim_state: %d trades, session_counter=%d, "
+        "invested=$%.2f, returned=$%.2f, W/L=%d/%d, sim_balance=$%.2f",
+        placed, session_counter, invested, returned, wins, losses, _sim_balance,
     )
 
 
@@ -4001,9 +4227,11 @@ async def post_init(app: Application) -> None:
     asyncio.create_task(ongoing_market_scanner(app))
     asyncio.create_task(ws_price_monitor(app))
     asyncio.create_task(tp_backup_poll(app))
+    asyncio.create_task(market_resolution_checker(app))  # closes positions when market ends
     asyncio.create_task(fill_monitor(app))
     asyncio.create_task(daily_summary_job(app))
     log.info("All background tasks launched ✓")
+
 
 
 def main() -> None:
