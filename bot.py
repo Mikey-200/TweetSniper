@@ -3416,29 +3416,45 @@ async def scan_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         markets.sort(key=lambda m: m.get("endDate", "9999"))
     report = await _build_market_scan_report(markets, "Forced Scan Results")
     await msg.reply_text(report, parse_mode="HTML")
-    # Process any unseen tradeable markets
-    dispatched = 0
+
+    # Process markets SEQUENTIALLY, soonest-expiring first.
+    # Only add to seen_market_ids when a trade actually fires (same logic as scanners).
+    traded_count = 0
+    skipped_count = 0
     for market in markets:
         market_id  = market.get("id", market.get("conditionId", ""))
         question   = market.get("question", "")
         market_key = question[:30]
-        if market_key in open_positions_by_market:
-            continue
         if market_id in seen_market_ids:
+            skipped_count += 1
             continue
-        seen_market_ids.add(market_id)
-        asyncio.create_task(process_market(ctx.application, market, is_ongoing=True))
-        dispatched += 1
-    if dispatched:
+        if market_key in open_positions_by_market:
+            skipped_count += 1
+            continue
+        traded = await process_market(ctx.application, market, is_ongoing=True)
+        if traded:
+            seen_market_ids.add(market_id)
+            traded_count += 1
+            break  # only trade one market per force scan
+
+    if traded_count:
         await msg.reply_text(
-            f"✅ Dispatched <b>{dispatched}</b> markets for trading "
-            f"(soonest-first).",
+            f"✅ <b>Trade placed</b> on {traded_count} market(s). Check History for details.",
             parse_mode="HTML",
+            reply_markup=main_menu_keyboard(),
+        )
+    elif skipped_count == len(markets):
+        await msg.reply_text(
+            "💤 No new markets to trade — all already traded or in positions.",
+            parse_mode="HTML",
+            reply_markup=main_menu_keyboard(),
         )
     else:
         await msg.reply_text(
-            "💤 No new markets to trade — all already seen or in positions.",
+            "🔄 Markets evaluated — no qualifying entry found right now.\n"
+            "   (Gate may be blocking: price cap, 12h age, or <8h remaining)",
             parse_mode="HTML",
+            reply_markup=main_menu_keyboard(),
         )
 
 
@@ -3810,6 +3826,90 @@ async def sync_positions_from_clob() -> int:
     return restored
 
 
+async def restore_sim_state_from_csv() -> None:
+    """On startup, reconstruct in-memory state from ALL CSV rows (SIM + real).
+
+    This prevents the bot from re-trading the same market after a restart:
+    - Rebuilds session_counter to the highest ever session number
+    - Rebuilds pnl_summary from closed rows and open/SIM rows
+    - Adds token_ids from SIM/real trades to traded_token_ids (re-buy guard)
+    - Adds market_keys from SIM rows to open_positions_by_market so the
+      ongoing scanner doesn't re-lock the same market
+    """
+    global session_counter, pnl_summary, traded_token_ids
+
+    rows = load_csv_rows()
+    if not rows:
+        return
+
+    invested   = 0.0
+    returned   = 0.0
+    placed     = 0
+    closed     = 0
+    wins       = 0
+    losses     = 0
+    max_snum   = session_counter  # don't lower it if already restored by OPEN positions
+
+    for row in rows:
+        status   = row.get("buy_status", "")
+        token_id = row.get("token_id", "")
+        market_key = row.get("market_key", row.get("market_question", "")[:30])
+        order_id   = row.get("buy_order_id", "")
+
+        try:
+            snum     = int(row.get("session_num", 0) or 0)
+            cost     = float(row.get("cost_usd",  0) or 0)
+            profit   = float(row.get("profit_usd", 0) or 0) if row.get("profit_usd") else None
+        except (ValueError, TypeError):
+            continue
+
+        if snum > max_snum:
+            max_snum = snum
+
+        # Re-buy guard: never buy the same token again
+        if token_id:
+            traded_token_ids.add(token_id)
+
+        placed += 1
+        invested += cost
+
+        # For SIM trades: mark market as "occupied" so scanner won't re-lock it
+        if status == "SIM" and market_key and order_id:
+            if market_key not in open_positions_by_market:
+                open_positions_by_market[market_key] = order_id
+                log.info("Restored SIM position guard: %s → %s", market_key, order_id)
+
+        # Closed trades: reconstruct win/loss and returned amount
+        if profit is not None:
+            sell_raw = row.get("sell_price", "")
+            size_raw = row.get("size_shares", "")
+            try:
+                sell_price  = float(sell_raw) if sell_raw else 0.0
+                size_shares = float(size_raw) if size_raw else 0.0
+                returned   += sell_price * size_shares
+            except (ValueError, TypeError):
+                returned += max(0.0, cost + profit)  # fallback
+            closed += 1
+            if profit >= 0:
+                wins += 1
+            else:
+                losses += 1
+
+    session_counter = max_snum
+    pnl_summary["trades_placed"]   = placed
+    pnl_summary["trades_closed"]   = closed
+    pnl_summary["wins"]            = wins
+    pnl_summary["losses"]          = losses
+    pnl_summary["total_invested"]  = invested
+    pnl_summary["total_returned"]  = returned
+
+    log.info(
+        "restore_sim_state: %d trades loaded, session_counter=%d, "
+        "invested=$%.2f, returned=$%.2f, W/L=%d/%d",
+        placed, session_counter, invested, returned, wins, losses,
+    )
+
+
 async def post_init(app: Application) -> None:
     """Launch all background tasks after the bot is initialized."""
     log.info("Starting TweetSniper background tasks…")
@@ -3821,6 +3921,11 @@ async def post_init(app: Application) -> None:
     # Restore open positions from CSV (primary) then CLOB (fallback)
     csv_restored  = await restore_positions_from_csv()
     clob_restored = await sync_positions_from_clob()
+
+    # Reconstruct session state from ALL CSV rows (SIM + real, closed + open)
+    # This prevents re-trading same markets and fixes session_counter / pnl_summary
+    await restore_sim_state_from_csv()
+
     total_restored = csv_restored + clob_restored
     restore_note = (
         f"\n  ♻️ Restored {total_restored} open position(s) "
