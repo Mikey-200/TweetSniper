@@ -228,6 +228,9 @@ pnl_summary = {
     "losses": 0,
 }
 
+# Virtual SIM wallet — tracks paper-trading balance across trades
+_sim_balance: float = float(os.getenv("SIM_BALANCE_USD", "10.0"))
+
 # For daily summary scheduling
 _last_summary_day: Optional[int] = None
 
@@ -2106,16 +2109,20 @@ async def process_market(app: Application, market: dict,
             )
             if token_price <= 0:
                 continue
-            sim_bet = kelly_bet_size(p_fused, token_price, sim_balance, ORDER_SIZE_USD)
+            global _sim_balance
+            sim_bet = kelly_bet_size(p_fused, token_price, _sim_balance, ORDER_SIZE_USD)
             if sim_bet <= 0:
                 sim_msgs.append(f"  ⏭ <b>{label}</b> — negative edge, skip")
                 continue
             sim_shares = round(sim_bet / token_price, 2)
-            tp_target  = round(token_price * tp_mult, 4)
+            # Prediction markets cap at $1.00 — 2× TP is physically unreachable.
+            # Exit target = $0.95: fires when the bucket is ~95% certain to win.
+            tp_target  = round(min(token_price * tp_mult, 0.95), 4)
             sl_price   = round(token_price * (1 - STOP_LOSS_PCT), 4)
             global session_counter
             session_counter += 1
             sim_session = session_counter
+            _sim_balance = max(0.0, _sim_balance - sim_bet)  # deduct from virtual wallet
             # Record to trades.csv exactly like a real trade (status = "SIM")
             append_csv_row({
                 "session_num":    sim_session,
@@ -2139,12 +2146,13 @@ async def process_market(app: Application, market: dict,
                 "token_id":        token_id,
                 "market_key":      market_key,
             })
-            # Register in open_positions so the TP/SL monitor tracks it
+            # Register in open_positions so the TP/SL monitor tracks it.
+            # Keys MUST match what execute_tp / execute_stop_loss expect.
             open_positions[f"SIM-{sim_session}"] = {
                 "order_id":    f"SIM-{sim_session}",
                 "token_id":    token_id,
-                "label":       label,
-                "entry_price": token_price,
+                "bucket":      label,        # was "label" — fixed to match execute_tp
+                "buy_price":   token_price,  # was "entry_price" — fixed to match execute_tp
                 "tp_target":   tp_target,
                 "sl_price":    sl_price,
                 "size_shares": sim_shares,
@@ -2155,7 +2163,8 @@ async def process_market(app: Application, market: dict,
             }
             open_positions_by_market[market_key] = f"SIM-{sim_session}"
             traded_token_ids.add(token_id)
-            pnl_summary["trades_placed"] += 1
+            pnl_summary["trades_placed"]  += 1
+            pnl_summary["total_invested"] += sim_bet
             sim_msgs.append(
                 f"  📝 <b>{label}</b>  @${token_price:.3f}  "
                 f"→ {sim_shares} shares  (${sim_bet:.2f} virtual)\n"
@@ -2163,7 +2172,10 @@ async def process_market(app: Application, market: dict,
                 f"Conf: {bucket_conf}%"
             )
             placed_sim = True
-        sim_msgs.append("\n<i>No real funds used. Monitoring for simulated TP/SL...</i>")
+        sim_msgs.append(
+            f"\n💰 <b>Virtual balance remaining: ${_sim_balance:.2f}</b>\n"
+            f"<i>No real funds used. Monitoring for simulated TP/SL...</i>"
+        )
         await send_message(app, "\n".join(sim_msgs))
         return placed_sim
         # ─────────────────────────────────────────────────────────────────────
@@ -2769,17 +2781,32 @@ async def fill_monitor(app: Application) -> None:
 # ──────────────────────────────────────────────────────────────────────
 
 async def _build_market_scan_report(markets: list, label: str) -> str:
-    """Build a Telegram message summarising the top-3 markets found."""
-    if not markets:
+    """Build a Telegram message summarising the top-3 active markets.
+    Filters expired markets: Elon tweet markets always end at 16:00 UTC,
+    so any market whose endDate T16:00 UTC is already past is excluded.
+    """
+    now_utc = datetime.now(timezone.utc)
+    active_markets = []
+    for m in markets:
+        end_raw = (m.get("endDate") or "")[:10]
+        if end_raw:
+            try:
+                end_dt = datetime.fromisoformat(end_raw + "T16:00:00+00:00")
+                if end_dt <= now_utc:
+                    continue  # already resolved — skip from display
+            except Exception:
+                pass
+        active_markets.append(m)
+
+    if not active_markets:
         return f"🔍 <b>{label}</b>\n  No active Elon tweet markets found right now."
 
-    lines = [f"🔍 <b>{label}</b> — {len(markets)} market(s) found\n"]
-    for i, m in enumerate(markets[:3]):
+    lines = [f"🔍 <b>{label}</b> — {len(active_markets)} market(s) found\n"]
+    for i, m in enumerate(active_markets[:3]):
         q       = m.get("question", "Unknown")[:70]
         end_raw = (m.get("endDate") or "")[:10]
         slug    = m.get("slug", "")
         pm_url  = f"https://polymarket.com/event/{slug}" if slug else "https://polymarket.com"
-        # parse outcomes to show bucket count
         try:
             outcomes = json.loads(m.get("outcomes", "[]"))
         except Exception:
@@ -2790,9 +2817,11 @@ async def _build_market_scan_report(markets: list, label: str) -> str:
             f"   ⏰ Ends: {end_raw}  |  🪣 {n_buckets} buckets\n"
             f"   🔗 <a href='{pm_url}'>View on Polymarket</a>\n"
         )
-    if len(markets) > 3:
-        lines.append(f"   …and {len(markets)-3} more.")
+    if len(active_markets) > 3:
+        lines.append(f"   …and {len(active_markets)-3} more.")
     return "\n".join(lines)
+
+
 
 
 async def fast_market_scanner(app: Application) -> None:
@@ -3923,7 +3952,6 @@ async def post_init(app: Application) -> None:
     clob_restored = await sync_positions_from_clob()
 
     # Reconstruct session state from ALL CSV rows (SIM + real, closed + open)
-    # This prevents re-trading same markets and fixes session_counter / pnl_summary
     await restore_sim_state_from_csv()
 
     total_restored = csv_restored + clob_restored
