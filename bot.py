@@ -132,7 +132,7 @@ TP_SLOTS = [
 ]
 
 # === Dry Run ===
-DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
+# DRY_RUN removed — bot always trades live when CLOB is configured.
 
 # === API URLs ===
 CLOB_HOST        = "https://clob.polymarket.com"
@@ -213,6 +213,7 @@ _locked_market_id:       str           = ""    # Gamma/Polymarket market ID
 _locked_market_end_dt:   Optional[datetime] = None   # UTC end time of locked market
 _locked_market_title:    str           = ""    # human-readable (for notifications)
 _locked_market_start_dt: Optional[datetime] = None   # to compute market age hours
+_locked_market_slug:     str           = ""    # event slug (for Polymarket link + XTracker match)
 _monitored_notified_ids: dict = {}  # market_id → last_notify_timestamp (time-based, re-notifies every 15 min)
 
 # ── Method 5: dynamic prior strength (empirical Bayes) ────────────────────────
@@ -229,7 +230,7 @@ pnl_summary = {
 }
 
 # Virtual SIM wallet — tracks paper-trading balance across trades
-_sim_balance: float = float(os.getenv("SIM_BALANCE_USD", "10.0"))
+# (SIM balance removed — bot is always in live mode)
 
 # For daily summary scheduling
 _last_summary_day: Optional[int] = None
@@ -1782,6 +1783,7 @@ async def process_market(app: Application, market: dict,
     """
     global session_counter, _locked_market_id, _locked_market_end_dt
     global _locked_market_title, _locked_market_start_dt, _monitored_notified_ids
+    global _locked_market_slug
 
     question   = market.get("question", "Unknown")
     market_key = question[:30]
@@ -1802,6 +1804,7 @@ async def process_market(app: Application, market: dict,
             f"   Scanning for the next market now…")
         _locked_market_id       = ""
         _locked_market_title    = ""
+        _locked_market_slug     = ""
         _locked_market_end_dt   = None
         _locked_market_start_dt = None
 
@@ -1814,6 +1817,7 @@ async def process_market(app: Application, market: dict,
     if not _locked_market_id:
         _locked_market_id    = market_id
         _locked_market_title = question
+        _locked_market_slug  = market.get("slug", "")
         # Parse market start date from pace or market dict
         start_raw = market.get("startDate") or market.get("created_at", "")
         try:
@@ -1827,7 +1831,7 @@ async def process_market(app: Application, market: dict,
             _locked_market_end_dt = datetime.fromisoformat(end_raw.replace("Z", "+00:00"))
         except Exception:
             _locked_market_end_dt = None
-        log.info("Locked onto market: %s", question[:60])
+        log.info("Locked onto market: %s (slug: %s)", question[:60], _locked_market_slug)
 
     # ── EXPIRY GUARD — skip if market has already ended ─────────────────────
     # Belt-and-suspenders: even if fetch_elon_markets let it through (API lag),
@@ -1853,6 +1857,7 @@ async def process_market(app: Application, market: dict,
             # Release the lock so the scanner picks up the NEXT market next cycle
             _locked_market_id       = ""
             _locked_market_title    = ""
+            _locked_market_slug     = ""
             _locked_market_end_dt   = None
             _locked_market_start_dt = None
             return False
@@ -2028,52 +2033,49 @@ async def process_market(app: Application, market: dict,
         filtered_tokens.append(tok)
     selected_tokens = filtered_tokens
 
-    # ── UNIFIED ANALYSIS NOTIFICATION ───────────────────────────────────────
-    # All notifications for this market share ONE rate-limit window (15 min).
-    # This ensures the user ALWAYS sees the full pace analysis before seeing
-    # the skip/trade decision — whether or not a trade fires.
+    # ── ANALYSIS NOTIFICATION (rate-limited: one per 15 min per market) ─────
     _analysis_key = f"analysis_{market_id}"
     _ANALYSIS_INTERVAL = 15 * 60
     _now_ts = time.time()
     _analysis_due = (_now_ts - _monitored_notified_ids.get(_analysis_key, 0) >= _ANALYSIS_INTERVAL)
 
     if skipped_summary and _analysis_due:
-        # Build embedded pace context (same info as the pre-buy alert)
         _pace_ctx = ""
         if pace:
-            _total   = int(pace.get("total", 0))
-            _hrs_rem = pace.get("hours_remaining", 0)
-            _rate    = pace.get("hourly_avg", 0)
-            _proj    = pace.get("projected", 0)
-            _sigma   = pace.get("sigma", 0)
-            _cred    = pace.get("credibility_z", 0.5) * 100
+            _total    = int(pace.get("total", 0))
+            _hrs_rem  = pace.get("hours_remaining", 0)
+            _rate     = pace.get("hourly_avg", 0)
+            _proj     = pace.get("projected", 0)
+            _sigma    = pace.get("sigma", 0)
+            _cred     = pace.get("credibility_z", 0.5) * 100
             _conf_lbl = ("High" if _cred >= 60 else "Medium" if _cred >= 35 else "Low")
             _pace_ctx = (
                 f"   📊 {_total} tweets so far  ·  {_hrs_rem:.1f}h left\n"
                 f"   Tweeting at {_rate:.1f}/hr  ·  Confidence: {_conf_lbl} — {_cred:.0f}% from live data\n"
                 f"   Projected: {_proj:.0f} tweets  (likely range: {_proj-_sigma:.0f}–{_proj+_sigma:.0f})\n\n"
             )
-        _hrs_left = (_locked_market_end_dt - datetime.now(timezone.utc)).total_seconds() / 3600 \
-                    if _locked_market_end_dt else 0
+        _hrs_left = (
+            (_locked_market_end_dt - datetime.now(timezone.utc)).total_seconds() / 3600
+            if _locked_market_end_dt else 0
+        )
         _skip_lines = "\n".join(
             f"   ⏭ <b>{lbl}</b> @ ${pr:.3f}  ({c}% conf)  — {rsn}"
             for lbl, pr, c, rsn in skipped_summary
         )
         _monitored_notified_ids[_analysis_key] = _now_ts
-        _dry = " [SIM]" if DRY_RUN else ""
         await send_message(app,
-            f"📍 <b>{question[:55]}</b>{_dry}\n"
+            f"📍 <b>{question[:55]}</b>\n"
             f"   ⏰ Ends in: {_hrs_left:.1f}h\n\n"
             f"{_pace_ctx}"
             f"{_skip_lines}\n\n"
-            f"   💡 Monitoring for better entry — will re-check every ~5 min.")
+            f"   💡 Monitoring for better entry — re-checking every ~5 min.")
     # ─────────────────────────────────────────────────────────────────────────
 
     if not selected_tokens:
         log.warning("No valid buckets for: %s", question[:60])
         return False
 
-    # Pre-trade announcement: tell the user WHAT we're about to buy
+    # Pre-trade announcement (shares same 15-min window as skip notification)
     planned = []
     for tok in selected_tokens:
         token_id, label = tok[0], tok[1]
@@ -2081,110 +2083,15 @@ async def process_market(app: Application, market: dict,
             (float(t["price"]) for t in tokens if t["token_id"] == token_id), 0.0
         )
         planned.append((label, token_price))
-    # Use the SAME analysis key — so alert and skip are always on the same 15-min clock
     if _analysis_due:
         _monitored_notified_ids[_analysis_key] = _now_ts
         await send_pre_buy_alert(app, market, pace, tokens, planned, is_ongoing)
 
-
-    if DRY_RUN:
-        # DRY_RUN does NOT need the CLOB client — simulation only
-        # ── PAPER TRADING SIMULATION ─────────────────────────────────────────
-        # Simulates real trades without touching real funds.
-        # Records fake positions to trades.csv (buy_status = "SIM") so you can
-        # track how the strategy would have performed.
-        # The simulated exit happens when ws_price_monitor sees the price move
-        # (it reads open_positions regardless of DRY_RUN flag).
-        sim_balance = float(os.getenv("SIM_BALANCE_USD", "10.0"))  # virtual wallet
-        sim_msgs = [f"🎮 <b>SIMULATION MODE</b> — virtual ${sim_balance:.2f} wallet\n"]
-        placed_sim = False
-        for tok in selected_tokens:
-            token_id, label = tok[0], tok[1]
-            slot_idx = tok[2]
-            p_fused   = tok[5] if len(tok) > 5 else 0.0
-            bucket_conf = tok[6] if len(tok) > 6 else 50
-            tp_mult   = TP_SLOTS[slot_idx] if slot_idx < len(TP_SLOTS) else 2.0
-            token_price = next(
-                (float(t["price"]) for t in tokens if t["token_id"] == token_id), 0.0
-            )
-            if token_price <= 0:
-                continue
-            global _sim_balance
-            sim_bet = kelly_bet_size(p_fused, token_price, _sim_balance, ORDER_SIZE_USD)
-            if sim_bet <= 0:
-                sim_msgs.append(f"  ⏭ <b>{label}</b> — negative edge, skip")
-                continue
-            sim_shares = round(sim_bet / token_price, 2)
-            # Prediction markets cap at $1.00 — 2× TP is physically unreachable.
-            # Exit target = $0.95: fires when the bucket is ~95% certain to win.
-            tp_target  = round(min(token_price * tp_mult, 0.95), 4)
-            sl_price   = round(token_price * (1 - STOP_LOSS_PCT), 4)
-            global session_counter
-            session_counter += 1
-            sim_session = session_counter
-            _sim_balance = max(0.0, _sim_balance - sim_bet)  # deduct from virtual wallet
-            # Record to trades.csv exactly like a real trade (status = "SIM")
-            append_csv_row({
-                "session_num":    sim_session,
-                "timestamp_utc":  datetime.now(timezone.utc).isoformat(),
-                "market_question": question,
-                "bucket":          label,
-                "slot":            slot_idx,
-                "buy_price":       token_price,
-                "size_shares":     sim_shares,
-                "cost_usd":        sim_bet,
-                "tp_target":       tp_target,
-                "tp_mult":         tp_mult,
-                "buy_order_id":    f"SIM-{sim_session}",
-                "buy_status":      "SIM",
-                "sell_price":      "",
-                "sell_order_id":   "",
-                "profit_usd":      "",
-                "profit_pct":      "",
-                "spread_at_entry": 0.0,
-                "is_fallback_gtc": False,
-                "token_id":        token_id,
-                "market_key":      market_key,
-            })
-            # Register in open_positions so the TP/SL monitor tracks it.
-            # Keys MUST match what execute_tp / execute_stop_loss expect.
-            open_positions[f"SIM-{sim_session}"] = {
-                "order_id":    f"SIM-{sim_session}",
-                "token_id":    token_id,
-                "bucket":      label,        # was "label" — fixed to match execute_tp
-                "buy_price":   token_price,  # was "entry_price" — fixed to match execute_tp
-                "tp_target":   tp_target,
-                "sl_price":    sl_price,
-                "size_shares": sim_shares,
-                "cost_usd":    sim_bet,
-                "session_num": sim_session,
-                "market_key":  market_key,
-                "is_sim":      True,
-            }
-            open_positions_by_market[market_key] = f"SIM-{sim_session}"
-            traded_token_ids.add(token_id)
-            pnl_summary["trades_placed"]  += 1
-            pnl_summary["total_invested"] += sim_bet
-            sim_msgs.append(
-                f"  📝 <b>{label}</b>  @${token_price:.3f}  "
-                f"→ {sim_shares} shares  (${sim_bet:.2f} virtual)\n"
-                f"     TP: ${tp_target:.3f}  ·  SL: ${sl_price:.3f}  ·  "
-                f"Conf: {bucket_conf}%"
-            )
-            placed_sim = True
-        sim_msgs.append(
-            f"\n💰 <b>Virtual balance remaining: ${_sim_balance:.2f}</b>\n"
-            f"<i>No real funds used. Monitoring for simulated TP/SL...</i>"
-        )
-        await send_message(app, "\n".join(sim_msgs))
-        return placed_sim
-        # ─────────────────────────────────────────────────────────────────────
-
-    # ── Real trading: CLOB required ──────────────────────────────────────────
     if clob is None:
         await send_message(app,
             "⚠️ CLOB not configured — set POLYGON_PRIVATE_KEY + PROXY_WALLET_ADDRESS")
         return False
+
 
     num_to_buy = len(selected_tokens)
     required = ORDER_SIZE_USD * num_to_buy
@@ -2433,7 +2340,7 @@ async def execute_tp(order_id: str, app: Application,
     profit_pct    = 0.0
 
     try:
-        if clob and not DRY_RUN:
+        if clob:
             sell_args = OrderArgs(
                 token_id=token_id,
                 price=round(sell_price, 4),
@@ -2468,14 +2375,14 @@ async def execute_tp(order_id: str, app: Application,
         rewrite_csv(rows)
 
         emoji    = "🚀" if profit_usd > 0 else "💥"
-        dry_note = " [DRY RUN]" if DRY_RUN else ""
+        # TP executed notification (no dry_note needed — always live)
         mult_achieved = sell_price / buy_price if buy_price > 0 else 1.0
         await send_message(app,
-            f"{emoji} <b>Profit taken{dry_note} — #{snum}  {pos['bucket']}</b>\n"
-            f"  Why: price reached {mult_achieved:.1f}× entry (our target was {pos['tp_mult']:.1f}×)\n"
-            f"  ${buy_price:.3f} → ${sell_price:.3f}  ·  "
+            f"\U0001f680 <b>Profit taken — #{snum}  {pos['bucket']}</b>\n"
+            f"  Why: price reached {mult_achieved:.1f}\u00d7 entry (our target was {pos['tp_mult']:.1f}\u00d7)\n"
+            f"  ${buy_price:.3f} \u2192 ${sell_price:.3f}  \u00b7  "
             f"<b>${profit_usd:+.2f} ({profit_pct:+.1f}%)</b>\n"
-            f"  👍 Confidence this was right: 90/100")
+            f"  \U0001f44d Confidence this was right: 90/100")
         log.info("TP executed for order #%d | P&L: $%.4f (%.1f%%)",
                  snum, profit_usd, profit_pct)
     except Exception as e:
@@ -2513,7 +2420,7 @@ async def execute_stop_loss(order_id: str, app: Application,
     loss_pct = 0.0
 
     try:
-        if clob and not DRY_RUN:
+        if clob:
             # Sell at current best bid — place limit slightly below to ensure fill
             sell_price_limit = max(round(trigger_price - 0.01, 4), 0.01)
             sell_args = OrderArgs(
@@ -2544,10 +2451,10 @@ async def execute_stop_loss(order_id: str, app: Application,
                 break
         rewrite_csv(rows)
 
-        dry_note = " [DRY RUN]" if DRY_RUN else ""
+        # Stop-loss notification
         loss_from_entry_pct = abs(loss_pct)
         await send_message(app,
-            f"🛑 <b>Stop-loss triggered{dry_note} — #{snum}  {pos['bucket']}</b>\n"
+            f"🛑 <b>Stop-loss triggered — #{snum}  {pos['bucket']}</b>\n"
             f"  Why: price fell {loss_from_entry_pct:.0f}% from entry "
             f"(threshold is {int(STOP_LOSS_PCT*100)}% drop)\n"
             f"  Market likely moved against this bucket — cutting loss now\n"
@@ -2744,7 +2651,7 @@ async def market_resolution_checker(app: Application) -> None:
     handle the real vs. simulated close difference internally.
     """
     global _locked_market_id, _locked_market_end_dt, \
-           _locked_market_title, _locked_market_start_dt, _sim_balance
+           _locked_market_title, _locked_market_start_dt, _locked_market_slug
 
     await asyncio.sleep(60)  # let WS and scanners start first
     while True:
@@ -2838,8 +2745,7 @@ async def market_resolution_checker(app: Application) -> None:
                         f"${pos['buy_price']:.3f} → ${current_price:.3f}  "
                         f"<b>${profit_usd:+.2f}</b>"
                     )
-                    if pos.get("is_sim"):
-                        _sim_balance += current_price * pos["size_shares"]
+                    pass  # live mode: no virtual balance to update
                 else:
                     log.info("Resolution: #%s %s LOST @ %.3f", snum, bucket, current_price)
                     await execute_stop_loss(order_id, app, max(current_price, 0.01))
@@ -2851,22 +2757,16 @@ async def market_resolution_checker(app: Application) -> None:
                     )
 
             # ── Build resolution notification ─────────────────────────────
-            sim_bal_line = (
-                f"\n  💰 Virtual balance: <b>${_sim_balance:.2f}</b>"
-                if DRY_RUN else ""
-            )
             pos_section = (
                 "\n" + "\n".join(closed_msgs)
                 if closed_msgs else "\n  💤 No position was held in this market."
             )
-            dry_tag = " [SIM]" if DRY_RUN else ""
 
             await send_message(app,
-                f"🏁 <b>Market Resolved{dry_tag}!</b>\n"
+                f"🏁 <b>Market Resolved!</b>\n"
                 f"  {(_locked_market_title or 'Unknown market')[:65]}\n\n"
                 f"  🏆 Winning bucket: <b>{winner_label}</b>  (${top_price:.3f})\n"
-                f"{pos_section}"
-                f"{sim_bal_line}\n\n"
+                f"{pos_section}\n\n"
                 f"  📋 /history for full P&L  ·  📊 /pnl for totals"
             )
 
@@ -2875,6 +2775,7 @@ async def market_resolution_checker(app: Application) -> None:
             _locked_market_id       = ""
             _locked_market_end_dt   = None
             _locked_market_title    = ""
+            _locked_market_slug     = ""
             _locked_market_start_dt = None
 
         except Exception as e:
@@ -2920,7 +2821,7 @@ async def fill_monitor(app: Application) -> None:
             if age > STALE_CANCEL_SECS:
                 log.warning("Auto-cancelling stale order #%d (%s)", snum, order_id)
                 try:
-                    if clob and not DRY_RUN:
+                    if clob:
                         await run_clob(clob.cancel, order_id)
                     open_positions.pop(order_id, None)
                     market_key = pos.get("market_key", "")
@@ -3235,38 +3136,39 @@ async def do_deposit(amount_usd: float, app: Application) -> None:
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📊 Orders",     callback_data="menu_orders"),
-            InlineKeyboardButton("💰 Balance",     callback_data="menu_balance"),
-            InlineKeyboardButton("📈 P&L",         callback_data="menu_pnl"),
+            InlineKeyboardButton("\U0001f4ca Orders",     callback_data="menu_orders"),
+            InlineKeyboardButton("\U0001f4b0 Balance",     callback_data="menu_balance"),
+            InlineKeyboardButton("\U0001f4c8 P&L",         callback_data="menu_pnl"),
         ],
         [
-            InlineKeyboardButton("🐦 Elon Pace",  callback_data="menu_pace"),
-            InlineKeyboardButton("🔍 Markets",    callback_data="menu_markets"),
-            InlineKeyboardButton("⚙️ Status",     callback_data="menu_status"),
+            InlineKeyboardButton("\U0001f426 Elon Pace",  callback_data="menu_pace"),
+            InlineKeyboardButton("\U0001f50d Markets",    callback_data="menu_markets"),
+            InlineKeyboardButton("\u2699\ufe0f Status",   callback_data="menu_status"),
         ],
         [
-            InlineKeyboardButton("🔄 Force Scan", callback_data="menu_scan"),
-            InlineKeyboardButton("📋 History",    callback_data="menu_history"),
-            InlineKeyboardButton("💳 Deposit",    callback_data="menu_deposit"),
+            InlineKeyboardButton("\U0001f3af Locked Market", callback_data="menu_locked"),
+            InlineKeyboardButton("\U0001f504 Force Scan",  callback_data="menu_scan"),
+            InlineKeyboardButton("\U0001f4cb History",    callback_data="menu_history"),
         ],
         [
-            InlineKeyboardButton("🏧 Withdraw",   callback_data="menu_withdraw"),
+            InlineKeyboardButton("\U0001f3e7 Withdraw",   callback_data="menu_withdraw"),
+            InlineKeyboardButton("\U0001f4b3 Deposit",    callback_data="menu_deposit"),
         ],
     ])
 
 
 async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Send main menu."""
-    dry_tag  = "  ⚠️ <b>TEST MODE</b> — no real orders placed\n" if DRY_RUN else ""
-    bal      = await get_proxy_balance()
-    mode_tag = "⚠️ TEST" if DRY_RUN else "🔴 LIVE"
+    bal = await get_proxy_balance()
+    locked_line = (
+        f"\nLocked: <b>{_locked_market_title[:45]}</b>" if _locked_market_id else ""
+    )
     await update.message.reply_text(
-        f"🎯 <b>TweetSniper</b>  ·  {mode_tag}\n"
-        f"{dry_tag}"
-        f"Balance: <b>${bal:.2f} USDC</b>" +
-        (f"  |  🎮 Virtual: <b>${_sim_balance:.2f}</b>" if DRY_RUN else "") +
-        f"\nPositions open: <b>{len(open_positions)}</b>\n"
-        f"Markets tracked: <b>{len(seen_market_ids)}</b>\n"
+        f"🎯 <b>TweetSniper</b>  ·  🔴 LIVE\n"
+        f"Balance: <b>${bal:.2f} USDC</b>\n"
+        f"Positions open: <b>{len(open_positions)}</b>\n"
+        f"Markets tracked: <b>{len(seen_market_ids)}</b>"
+        f"{locked_line}\n"
         f"\nTap a button 👇",
         parse_mode="HTML",
         reply_markup=main_menu_keyboard(),
@@ -3329,20 +3231,12 @@ async def balance_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception:
         eoa_addr = "invalid key"
 
-    sim_line = ""
-    if DRY_RUN:
-        sim_start = float(os.getenv("SIM_BALANCE_USD", "10.0"))
-        sim_line = (
-            f"\n  🎮 <b>SIM wallet: ${_sim_balance:.2f}</b>  "
-            f"(started ${sim_start:.2f})\n"
-        )
     await msg.reply_text(
-        f"💰 <b>Balances (on-chain)</b>\n"
-        f"  Trading balance: <b>${proxy_bal:.2f} USDC</b>\n"
-        f"{sim_line}\n"
-        f"  Proxy wallet: <code>{PROXY_WALLET[:24]}…</code>\n"
-        f"  EOA (signing): <code>{eoa_addr[:24]}…</code>\n\n"
-        f"  {'✅ Sufficient to trade' if proxy_bal >= ORDER_SIZE_USD else '⚠️ Insufficient — deposit more USDC'}",
+        f"\U0001f4b0 <b>Balances (on-chain)</b>\n"
+        f"  Trading balance: <b>${proxy_bal:.2f} USDC</b>\n\n"
+        f"  Proxy wallet: <code>{PROXY_WALLET[:24]}\u2026</code>\n"
+        f"  EOA (signing): <code>{eoa_addr[:24]}\u2026</code>\n\n"
+        f"  {'\u2705 Sufficient to trade' if proxy_bal >= ORDER_SIZE_USD else '\u26a0\ufe0f Insufficient \u2014 deposit more USDC'}",
         parse_mode="HTML",
         reply_markup=main_menu_keyboard(),
     )
@@ -3363,8 +3257,7 @@ async def history_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     # Show last 10, newest first
     recent = list(reversed(rows[-10:]))
-    sim_note = "  <i>(SIM = paper trade)</i>" if any(r.get("buy_status") == "SIM" for r in recent) else ""
-    lines = [f"📋 <b>Trade History</b> — last {len(recent)} of {len(rows)}{sim_note}\n"]
+    lines = [f"📋 <b>Trade History</b> — last {len(recent)} of {len(rows)}\n"]
     for r in recent:
         status = r.get("buy_status", "?")
         snum   = r.get("session_num", "?")
@@ -3381,8 +3274,7 @@ async def history_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             ts = ts_raw[:16]
 
         status_emoji = (
-            "🎮" if status == "SIM"
-            else "✅" if status in ("TP", "CLOSED")  # TP or resolved WIN
+            "✅" if status in ("TP", "CLOSED")  # TP or resolved WIN
             else "🛑" if status == "STOP_LOSS"
             else "⏳" if status == "OPEN"
             else "🏁" if status == "RESOLVED"
@@ -3577,16 +3469,24 @@ async def pace_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Show bot config and health."""
     msg    = update.message or update.callback_query.message
-    clob_s = "✅" if clob else "❌"
-    mode_s = "⚠️ TEST" if DRY_RUN else "🔴 LIVE"
+    clob_s = "\u2705 Connected" if clob else "\u274c Not connected"
+    locked_line = ""
+    if _locked_market_id and _locked_market_title:
+        hrs_left = (
+            (_locked_market_end_dt - datetime.now(timezone.utc)).total_seconds() / 3600
+            if _locked_market_end_dt else 0
+        )
+        locked_line = f"  Locked: <b>{_locked_market_title[:45]}</b> ({hrs_left:.1f}h left)\n"
     await msg.reply_text(
-        f"⚙️ <b>Bot Status</b>  ·  {mode_s}\n"
-        f"  CLOB:      {clob_s}   Positions: {len(open_positions)}   Seen: {len(seen_market_ids)}\n"
-        f"  Order:     ${ORDER_SIZE_USD:.2f} × {BUCKETS_TO_BUY} buckets\n"
-        f"  Max price: ${MAX_BUY_PRICE:.2f} new  /  ${MAX_BUY_PRICE_ONGOING:.2f} ongoing\n"
-        f"  TP target: {TP_SLOTS[0]}×   Spread cap: ${MAX_SPREAD:.2f}\n"
+        f"\u2699\ufe0f <b>Bot Status</b>  \u00b7  \U0001f534 LIVE\n"
+        f"  CLOB:      {clob_s}\n"
+        f"  Positions: {len(open_positions)}   Seen markets: {len(seen_market_ids)}\n"
+        f"{locked_line}"
+        f"  Order:     ${ORDER_SIZE_USD:.2f} \u00d7 {BUCKETS_TO_BUY} buckets\n"
+        f"  Max price: ${MAX_BUY_PRICE:.2f}   Min price: ${MIN_BUY_PRICE:.2f}\n"
+        f"  TP:        {TP_SLOTS[0]}\u00d7  (cap $0.95)   Spread cap: ${MAX_SPREAD:.2f}\n"
         f"  Scan:      every {MARKET_POLL_SECS}s  (ongoing: {ONGOING_RESCAN_SECS}s)\n"
-        f"  Wallet:    <code>{PROXY_WALLET[:20]}…</code>",
+        f"  Wallet:    <code>{PROXY_WALLET[:20]}\u2026</code>",
         parse_mode="HTML",
         reply_markup=main_menu_keyboard(),
     )
@@ -3654,6 +3554,154 @@ async def scan_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             parse_mode="HTML",
             reply_markup=main_menu_keyboard(),
         )
+
+
+async def locked_market_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show full details about the currently locked market."""
+    msg = update.message or update.callback_query.message
+
+    if not _locked_market_id:
+        await msg.reply_text(
+            "🔓 <b>No market locked right now.</b>\n"
+            "The bot will lock onto the earliest-expiring Elon tweet market it finds.",
+            parse_mode="HTML",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    now_utc  = datetime.now(timezone.utc)
+    pm_link  = f"https://polymarket.com/event/{_locked_market_slug}" if _locked_market_slug else POLYMARKET_BASE
+
+    # ── Time remaining & market age ──
+    hrs_left = 0.0
+    if _locked_market_end_dt:
+        hrs_left = max(0.0, (_locked_market_end_dt - now_utc).total_seconds() / 3600)
+    hrs_left_str = (
+        f"<b>{hrs_left:.1f}h</b>" if hrs_left < 24 else
+        f"<b>{hrs_left/24:.1f}d</b> ({hrs_left:.0f}h)"
+    )
+
+    market_age_hrs = 0.0
+    if _locked_market_start_dt:
+        market_age_hrs = (now_utc - _locked_market_start_dt).total_seconds() / 3600
+    age_str    = f"{market_age_hrs:.1f}h" if market_age_hrs >= 1 else f"{market_age_hrs*60:.0f}min"
+    age_status = "✅ gate passed" if market_age_hrs >= MIN_MARKET_AGE_HOURS else f"⏳ waiting (need {MIN_MARKET_AGE_HOURS:.0f}h)"
+    end_str    = _locked_market_end_dt.strftime("%b %d, %Y at %H:%M UTC") if _locked_market_end_dt else "Unknown"
+
+    lines = [
+        f"📍 <b>Locked Market Details</b>",
+        f"",
+        f"📌 <b>{_locked_market_title[:70]}</b>",
+        f"🔗 <a href='{pm_link}'>View on Polymarket</a>",
+        f"",
+        f"⏰ Ends: {end_str}",
+        f"   Time remaining: {hrs_left_str}",
+        f"⏱ Market age: {age_str}  ({age_status})",
+    ]
+
+    # ── Fetch live SABP pace ──
+    pace = await fetch_elon_pace(market_slug=_locked_market_slug)
+    if pace:
+        total    = int(pace["total"])
+        proj     = int(pace["projected"])
+        sigma    = pace.get("sigma", 0.0)
+        lam_post = pace.get("lambda_posterior", pace["hourly_avg"])
+        cred_z   = pace.get("credibility_z", 0.0)
+        hrs_el   = pace["hours_elapsed"]
+        proj_lo  = max(0, proj - int(sigma))
+        proj_hi  = proj + int(sigma)
+        mismatch = pace.get("period_mismatch", False)
+
+        if cred_z < 0.2:
+            cred_label = f"Low — anchored to history ({cred_z:.0%} live)"
+        elif cred_z < 0.6:
+            cred_label = f"Medium — blending ({cred_z:.0%} live + {(1-cred_z):.0%} hist)"
+        else:
+            cred_label = f"High — data-driven ({cred_z:.0%} live)"
+
+        mismatch_warn = "  ⚠️ Period mismatch — using historical rate only" if mismatch else ""
+
+        lines += [
+            f"",
+            f"📊 <b>Live Pace (SABP)</b>",
+            f"  Tweets so far: <b>{total}</b>  ·  {hrs_el:.0f}h elapsed",
+            f"  Tweeting at: <b>{lam_post:.1f}/hr</b>",
+            f"  Confidence: {cred_label}",
+            f"  Projected total: <b>~{proj} tweets</b>  (range: {proj_lo}–{proj_hi})",
+            mismatch_warn,
+        ]
+
+        # ── Bucket probabilities ──
+        try:
+            cli_markets = await fetch_elon_markets_cli()
+            locked_mkt  = next(
+                (m for m in cli_markets
+                 if _locked_market_slug and m.get("slug", "").startswith(_locked_market_slug[:20])),
+                None,
+            )
+            if locked_mkt and sigma > 0:
+                outcomes_raw   = locked_mkt.get("outcomes", "[]")
+                prices_raw     = locked_mkt.get("outcomePrices", "[]")
+                outcome_labels = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+                price_list     = json.loads(prices_raw)   if isinstance(prices_raw,   str) else prices_raw
+                nd             = NormalDist(mu=float(proj), sigma=float(sigma))
+
+                parsed_buckets = []
+                for idx, lbl in enumerate(outcome_labels):
+                    b = parse_bucket_label(lbl)
+                    if b is None:
+                        continue
+                    lo, hi = b
+                    p = (1 - nd.cdf(lo - 0.5)) if hi == 9999 else (nd.cdf(hi + 0.5) - nd.cdf(lo - 0.5))
+                    try:
+                        price_val = float(price_list[idx]) if idx < len(price_list) else 0.0
+                    except Exception:
+                        price_val = 0.0
+                    parsed_buckets.append((p, lbl, lo, price_val))
+                parsed_buckets.sort(key=lambda x: x[0], reverse=True)
+
+                # Identify peak bucket (where projection lands)
+                peak_lbl = next(
+                    (lbl for p, lbl, lo, _ in parsed_buckets
+                     if (b := parse_bucket_label(lbl)) and b[0] <= proj <= b[1]),
+                    parsed_buckets[0][1] if parsed_buckets else "",
+                )
+
+                lines += [f"", f"🪣 <b>Bucket Probabilities</b>"]
+                for p, lbl, lo, price_val in parsed_buckets[:8]:
+                    icon      = "🎯" if lbl == peak_lbl else ("✅" if p >= 0.10 else "⬜")
+                    peak_tag  = "  ← PEAK" if lbl == peak_lbl else ""
+                    price_str = f"  @${price_val:.3f}" if price_val > 0 else ""
+                    lines.append(f"  {icon} <b>{lbl}</b>  {p*100:.1f}%{price_str}{peak_tag}")
+        except Exception as e:
+            log.debug("locked_market_cmd: bucket fetch error: %s", e)
+    else:
+        lines += ["", "📊 <i>Pace data unavailable — XTracker may be offline</i>"]
+
+    # ── Open positions in this market ──
+    market_key_prefix = _locked_market_title[:30]
+    my_positions = [
+        pos for pos in open_positions.values()
+        if pos.get("market_key", "")[:30] == market_key_prefix[:30]
+    ]
+    if my_positions:
+        lines += [f"", f"📌 <b>My Open Positions ({len(my_positions)})</b>"]
+        for pos in my_positions:
+            snum   = pos.get("session_num", "?")
+            bucket = pos.get("bucket", "?")
+            buy_p  = pos.get("buy_price", 0)
+            tp     = pos.get("tp_target", 0)
+            cost   = pos.get("cost_usd", 0)
+            lines.append(f"  #{snum}  <b>{bucket}</b>  @ ${buy_p:.3f}  TP→${tp:.3f}  Cost: ${cost:.2f}")
+    else:
+        lines += [f"", f"💤 No open positions in this market yet."]
+
+    await msg.reply_text(
+        "\n".join(l for l in lines),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=main_menu_keyboard(),
+    )
 
 
 async def cancel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3731,7 +3779,7 @@ async def _cancel_order_by_snum(snum: int, msg, app: Application) -> None:
     open_positions_by_market.pop(market_key, None)
     order_registry.pop(snum, None)
     try:
-        if clob and not DRY_RUN:
+        if clob:
             await run_clob(clob.cancel, order_id)
         await msg.reply_text(
             f"✅ Order #{snum} cancelled\n"
@@ -3760,6 +3808,8 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         await balance_cmd(update, ctx)
     elif data == "menu_pnl":
         await pnl_cmd(update, ctx)
+    elif data == "menu_locked":
+        await locked_market_cmd(update, ctx)
     elif data == "menu_pace":
         await pace_cmd(update, ctx)
     elif data == "menu_status":
@@ -4025,14 +4075,12 @@ async def sync_positions_from_clob() -> int:
 
 
 async def restore_sim_state_from_csv() -> None:
-    """On startup, reconstruct in-memory state from ALL CSV rows (SIM + real).
+    """On startup, reconstruct session state from all CSV rows.
 
     This prevents the bot from re-trading the same market after a restart:
     - Rebuilds session_counter to the highest ever session number
-    - Rebuilds pnl_summary from closed rows and open/SIM rows
-    - Adds token_ids from SIM/real trades to traded_token_ids (re-buy guard)
-    - Adds market_keys from SIM rows to open_positions_by_market so the
-      ongoing scanner doesn't re-lock the same market
+    - Rebuilds pnl_summary from all historical rows
+    - Adds token_ids to traded_token_ids (re-buy guard)
     """
     global session_counter, pnl_summary, traded_token_ids
 
@@ -4071,11 +4119,6 @@ async def restore_sim_state_from_csv() -> None:
         placed += 1
         invested += cost
 
-        # For SIM trades: mark market as "occupied" so scanner won't re-lock it
-        if status == "SIM" and market_key and order_id:
-            if market_key not in open_positions_by_market:
-                open_positions_by_market[market_key] = order_id
-                log.info("Restored SIM position guard: %s → %s", market_key, order_id)
 
         # Closed trades: reconstruct win/loss and returned amount
         if profit is not None:
@@ -4100,68 +4143,10 @@ async def restore_sim_state_from_csv() -> None:
     pnl_summary["losses"]          = losses
     pnl_summary["total_invested"]  = invested
     pnl_summary["total_returned"]  = returned
-
-    # Reconstruct _sim_balance from SIM-prefixed CSV rows
-    global _sim_balance
-    _sim_balance = float(os.getenv("SIM_BALANCE_USD", "10.0"))
-    for row in rows:
-        if not str(row.get("buy_order_id", "")).startswith("SIM-"):
-            continue
-        try:
-            _sim_balance -= float(row.get("cost_usd", 0) or 0)
-            sp = row.get("sell_price", "")
-            ss = row.get("size_shares", "")
-            if sp and ss:
-                _sim_balance += float(sp) * float(ss)
-        except (ValueError, TypeError):
-            pass
-    _sim_balance = max(0.0, _sim_balance)
-
-    # Restore open SIM positions to open_positions so the TP/SL monitor
-    # and resolution checker can watch them after a restart.
-    for row in rows:
-        if row.get("buy_status", "") != "SIM":
-            continue
-        if row.get("profit_usd") or row.get("sell_price"):
-            continue  # already closed
-        order_id = row.get("buy_order_id", "")
-        token_id = row.get("token_id", "")
-        if not order_id or not token_id or order_id in open_positions:
-            continue
-        try:
-            buy_price   = float(row.get("buy_price",   0) or 0)
-            size_shares = float(row.get("size_shares", 0) or 0)
-            tp_raw      = row.get("tp_target", "")
-            tp_target   = float(tp_raw) if tp_raw else min(buy_price * 2.0, 0.95)
-            snum        = int(row.get("session_num",   0) or 0)
-            mkey        = row.get("market_key",        "")[:30]
-            cost        = float(row.get("cost_usd",    ORDER_SIZE_USD) or ORDER_SIZE_USD)
-        except (ValueError, TypeError):
-            continue
-        open_positions[order_id] = {
-            "order_id":    order_id,
-            "token_id":    token_id,
-            "bucket":      row.get("bucket", "?"),
-            "buy_price":   buy_price,
-            "tp_target":   tp_target,
-            "sl_price":    buy_price * (1 - STOP_LOSS_PCT),
-            "size_shares": size_shares,
-            "cost_usd":    cost,
-            "session_num": snum,
-            "market_key":  mkey,
-            "market_question": row.get("market_question", "Restored SIM"),
-            "placed_at":   time.time(),
-            "is_sim":      True,
-        }
-        if mkey not in open_positions_by_market:
-            open_positions_by_market[mkey] = order_id
-        log.info("Restored SIM position to open_positions: #%d %s @ $%.3f",
-                 snum, row.get("bucket", "?"), buy_price)
-
     log.info(
-        "restore_sim_state: %d trades, session_counter=%d, "
-        "invested=$%.2f, returned=$%.2f, W/L=%d/%d, sim_balance=$%.2f",
-        placed, session_counter, invested, returned, wins, losses, _sim_balance,
+        "restore_session_state: %d trades, session_counter=%d, "
+        "invested=$%.2f, returned=$%.2f, W/L=%d/%d",
+        placed, session_counter, invested, returned, wins, losses,
     )
 
 
@@ -4187,12 +4172,11 @@ async def post_init(app: Application) -> None:
         if total_restored else ""
     )
 
-    dry_note = " [DRY RUN]" if DRY_RUN else ""
     try:
         await app.bot.send_message(
             chat_id=TG_CHAT_ID,
             text=(
-                f"🚀 <b>TweetSniper Started{dry_note}</b>\n"
+                f"🚀 <b>TweetSniper Started</b>\n"
                 f"  Proxy wallet: <code>{PROXY_WALLET[:20]}…</code>\n"
                 f"  Order size:   ${ORDER_SIZE_USD:.2f}/bucket (max {BUCKETS_TO_BUY} buckets)\n"
                 f"  TP at:        {TP_SLOTS[0]}×\n"
@@ -4266,6 +4250,7 @@ def main() -> None:
     app.add_handler(CommandHandler("markets",  markets_cmd))
     app.add_handler(CommandHandler("scan",     scan_cmd))
     app.add_handler(CommandHandler("history",  history_cmd))
+    app.add_handler(CommandHandler("locked",   locked_market_cmd))
 
     # Inline button handler
     app.add_handler(CallbackQueryHandler(button_handler))
