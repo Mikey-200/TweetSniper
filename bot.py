@@ -2075,15 +2075,17 @@ async def process_market(app: Application, market: dict,
         log.warning("No valid buckets for: %s", question[:60])
         return False
 
-    # Pre-trade announcement (shares same 15-min window as skip notification)
+    # Pre-trade announcement — only include buckets that will pass the price cap.
+    # Prevents the bot announcing "Buying X at $0.334" when MAX_BUY_PRICE = $0.25.
     planned = []
     for tok in selected_tokens:
         token_id, label = tok[0], tok[1]
         token_price = next(
             (float(t["price"]) for t in tokens if t["token_id"] == token_id), 0.0
         )
-        planned.append((label, token_price))
-    if _analysis_due:
+        if token_price <= price_cap:   # only announce what will actually execute
+            planned.append((label, token_price))
+    if planned and _analysis_due:
         _monitored_notified_ids[_analysis_key] = _now_ts
         await send_pre_buy_alert(app, market, pace, tokens, planned, is_ongoing)
 
